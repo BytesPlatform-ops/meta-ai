@@ -1,0 +1,115 @@
+# ============================================================
+# Supabase API Gateway — Local Development
+# Routes /auth/v1/* → GoTrue, /rest/v1/* → PostgREST
+#
+# CORS is handled here at the gateway level to avoid duplicate
+# headers. GoTrue's own CORS is hidden behind proxy_hide_header.
+# ============================================================
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    # ── Upstreams ──────────────────────────────────────────────
+    upstream gotrue {
+        server supabase-auth:9999;
+    }
+
+    upstream postgrest {
+        server supabase-rest:3000;
+    }
+
+    server {
+        listen 80;
+        server_name _;
+
+        # Large headers (Supabase JWTs can be big)
+        large_client_header_buffers 4 32k;
+        proxy_buffer_size          16k;
+        proxy_buffers              4 32k;
+        proxy_busy_buffers_size    32k;
+
+        # ── Health check ──────────────────────────────────────
+        location = /health {
+            access_log off;
+            return 200 '{"status":"ok"}';
+            add_header Content-Type application/json;
+        }
+
+        # ── GoTrue Auth API ───────────────────────────────────
+        location /auth/v1/ {
+            # Handle preflight
+            if ($request_method = 'OPTIONS') {
+                add_header 'Access-Control-Allow-Origin'      '${CORS_ORIGIN}' always;
+                add_header 'Access-Control-Allow-Methods'     'GET, POST, PUT, PATCH, DELETE, OPTIONS' always;
+                add_header 'Access-Control-Allow-Headers'     'Authorization, apikey, Content-Type, X-Client-Info, Accept, X-Supabase-Api-Version' always;
+                add_header 'Access-Control-Allow-Credentials' 'true' always;
+                add_header 'Access-Control-Max-Age'           3600;
+                add_header 'Content-Length'                    0;
+                return 204;
+            }
+
+            proxy_pass http://gotrue/;
+
+            proxy_set_header Host              $host;
+            proxy_set_header X-Real-IP         $remote_addr;
+            proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+
+            # Hide GoTrue's own CORS headers to avoid duplicates
+            proxy_hide_header Access-Control-Allow-Origin;
+            proxy_hide_header Access-Control-Allow-Methods;
+            proxy_hide_header Access-Control-Allow-Headers;
+            proxy_hide_header Access-Control-Allow-Credentials;
+            proxy_hide_header Access-Control-Expose-Headers;
+
+            # Set our own CORS headers (specific origin, not *)
+            add_header 'Access-Control-Allow-Origin'      '${CORS_ORIGIN}' always;
+            add_header 'Access-Control-Allow-Methods'     'GET, POST, PUT, PATCH, DELETE, OPTIONS' always;
+            add_header 'Access-Control-Allow-Headers'     'Authorization, apikey, Content-Type, X-Client-Info, Accept, X-Supabase-Api-Version' always;
+            add_header 'Access-Control-Allow-Credentials' 'true' always;
+            add_header 'Access-Control-Expose-Headers'    'X-Total-Count, Link, X-Supabase-Api-Version' always;
+        }
+
+        # ── PostgREST REST API ────────────────────────────────
+        location /rest/v1/ {
+            # Handle preflight
+            if ($request_method = 'OPTIONS') {
+                add_header 'Access-Control-Allow-Origin'      '${CORS_ORIGIN}' always;
+                add_header 'Access-Control-Allow-Methods'     'GET, POST, PUT, PATCH, DELETE, OPTIONS' always;
+                add_header 'Access-Control-Allow-Headers'     'Authorization, apikey, Content-Type, X-Client-Info, Accept, Prefer, Range, Accept-Profile, Content-Profile' always;
+                add_header 'Access-Control-Allow-Credentials' 'true' always;
+                add_header 'Access-Control-Max-Age'           3600;
+                add_header 'Content-Length'                    0;
+                return 204;
+            }
+
+            proxy_pass http://postgrest/;
+
+            proxy_set_header Host              $host;
+            proxy_set_header X-Real-IP         $remote_addr;
+            proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_set_header Range             $http_range;
+            proxy_set_header If-Match          $http_if_match;
+            proxy_set_header If-None-Match     $http_if_none_match;
+            proxy_set_header Prefer            $http_prefer;
+            proxy_set_header Accept-Profile    $http_accept_profile;
+            proxy_set_header Content-Profile   $http_content_profile;
+
+            # CORS headers
+            add_header 'Access-Control-Allow-Origin'      '${CORS_ORIGIN}' always;
+            add_header 'Access-Control-Allow-Methods'     'GET, POST, PUT, PATCH, DELETE, OPTIONS' always;
+            add_header 'Access-Control-Allow-Headers'     'Authorization, apikey, Content-Type, X-Client-Info, Accept, Prefer, Range, Accept-Profile, Content-Profile' always;
+            add_header 'Access-Control-Allow-Credentials' 'true' always;
+            add_header 'Access-Control-Expose-Headers'    'Content-Range, Range, X-Total-Count' always;
+        }
+
+        # ── Fallback ──────────────────────────────────────────
+        location / {
+            return 404 '{"error":"Not found. Use /auth/v1/ or /rest/v1/"}';
+            add_header Content-Type application/json;
+        }
+    }
+}

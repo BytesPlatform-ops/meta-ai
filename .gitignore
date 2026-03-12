@@ -1,0 +1,38 @@
+# Dependencies
+node_modules/
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Environment
+.env
+backend/.env
+frontend/.env.local
+
+# Build
+.next/
+frontend/.next/
+dist/
+
+# Docker volumes
+supabase/docker/volumes/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Uploads
+backend/uploads/
+
+# Logs
+*.log
+
+# Skills (local)
+.skills/
