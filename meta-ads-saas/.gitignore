@@ -5,12 +5,10 @@ __pycache__/
 .venv/
 venv/
 
-# Environment & secrets
+# Environment
 .env
 backend/.env
 frontend/.env.local
-*.env.local
-!*.env.example
 
 # Build
 .next/
@@ -30,15 +28,11 @@ supabase/docker/volumes/
 .DS_Store
 Thumbs.db
 
-# Uploads (user media — too large for git)
+# Uploads
 backend/uploads/
-meta-ads-saas/backend/uploads/
 
 # Logs
 *.log
 
 # Skills (local)
 .skills/
-
-# Test artifacts
-test_pixel_logic.py

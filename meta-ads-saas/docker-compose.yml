@@ -1,0 +1,235 @@
+# ============================================================
+# Meta Ads AI — Local Development Stack
+# ============================================================
+# Services:
+#   supabase-db       → PostgreSQL 15                :5432
+#   supabase-auth     → GoTrue (Supabase Auth)       internal :9999
+#   supabase-rest     → PostgREST (Supabase REST)    internal :3000
+#   supabase-gateway  → nginx reverse proxy           :54321
+#   supabase-migration→ one-shot schema runner
+#   frontend          → Next.js                       :3000
+#   backend           → FastAPI                       :8000
+#   mcp-server        → Meta Marketing API MCP server  :8080
+#
+# Local Supabase stack — swap URL + keys to migrate to cloud.
+# ============================================================
+
+services:
+
+  # ─────────────────────────────────────────────────────────────
+  #  SUPABASE LOCAL SERVICES
+  # ─────────────────────────────────────────────────────────────
+
+  # ── Database — PostgreSQL 15 ────────────────────────────────
+  supabase-db:
+    image: postgres:15-alpine
+    ports:
+      - "${PORT_DB:-5432}:5432"
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    volumes:
+      - supabase-db-data:/var/lib/postgresql/data
+      - ./supabase/docker/init/00-supabase-roles.sql:/docker-entrypoint-initdb.d/00-supabase-roles.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - app-network
+
+  # ── Auth — GoTrue (Supabase Auth) ──────────────────────────
+  supabase-auth:
+    image: supabase/gotrue:v2.158.1
+    depends_on:
+      supabase-db:
+        condition: service_healthy
+    environment:
+      GOTRUE_API_HOST: "0.0.0.0"
+      GOTRUE_API_PORT: "9999"
+      API_EXTERNAL_URL: http://localhost:${PORT_SUPABASE:-54321}
+      GOTRUE_DB_DRIVER: postgres
+      GOTRUE_DB_DATABASE_URL: "postgres://supabase_auth_admin:postgres@supabase-db:5432/postgres"
+      GOTRUE_SITE_URL: http://localhost:${PORT_FRONTEND:-3000}
+      GOTRUE_URI_ALLOW_LIST: ""
+      GOTRUE_DISABLE_SIGNUP: "false"
+      GOTRUE_JWT_ADMIN_ROLES: service_role
+      GOTRUE_JWT_AUD: authenticated
+      GOTRUE_JWT_DEFAULT_GROUP_NAME: authenticated
+      GOTRUE_JWT_EXP: "3600"
+      GOTRUE_JWT_SECRET: super-secret-jwt-token-with-at-least-32-characters-long
+      GOTRUE_EXTERNAL_EMAIL_ENABLED: "true"
+      GOTRUE_MAILER_AUTOCONFIRM: "true"
+      GOTRUE_SMTP_ADMIN_EMAIL: admin@localhost
+      GOTRUE_SMTP_HOST: "localhost"
+      GOTRUE_SMTP_PORT: "587"
+      GOTRUE_SMTP_PASS: "unused"
+      GOTRUE_SMTP_SENDER_NAME: "Meta Ads AI"
+      GOTRUE_MAILER_URLPATHS_CONFIRMATION: "/auth/v1/verify"
+      GOTRUE_MAILER_URLPATHS_INVITE: "/auth/v1/verify"
+      GOTRUE_MAILER_URLPATHS_RECOVERY: "/auth/v1/verify"
+      GOTRUE_MAILER_URLPATHS_EMAIL_CHANGE: "/auth/v1/verify"
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9999/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - app-network
+
+  # ── REST API — PostgREST ────────────────────────────────────
+  supabase-rest:
+    image: postgrest/postgrest:v12.0.2
+    depends_on:
+      supabase-db:
+        condition: service_healthy
+    environment:
+      PGRST_DB_URI: "postgres://authenticator:postgres@supabase-db:5432/postgres"
+      PGRST_DB_SCHEMAS: public
+      PGRST_DB_ANON_ROLE: anon
+      PGRST_JWT_SECRET: super-secret-jwt-token-with-at-least-32-characters-long
+      PGRST_DB_USE_LEGACY_GUCS: "false"
+      PGRST_APP_SETTINGS_JWT_SECRET: super-secret-jwt-token-with-at-least-32-characters-long
+      PGRST_APP_SETTINGS_JWT_EXP: "3600"
+    networks:
+      - app-network
+
+  # ── API Gateway — nginx ─────────────────────────────────────
+  # Routes /auth/v1/* → GoTrue, /rest/v1/* → PostgREST
+  # Browser-accessible at http://localhost:54321
+  supabase-gateway:
+    image: nginx:alpine
+    ports:
+      - "${PORT_SUPABASE:-54321}:80"
+    environment:
+      CORS_ORIGIN: "http://localhost:${PORT_FRONTEND:-3000}"
+    volumes:
+      - ./supabase/docker/nginx/nginx.conf.template:/etc/nginx/templates/default.conf.template:ro
+    command: >
+      /bin/sh -c "envsubst '$$CORS_ORIGIN' < /etc/nginx/templates/default.conf.template > /etc/nginx/nginx.conf && nginx -g 'daemon off;'"
+    depends_on:
+      supabase-auth:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:80/health || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - app-network
+
+  # ── Migration Runner (one-shot) ─────────────────────────────
+  # Waits for GoTrue to create auth.users, then applies the app schema
+  supabase-migration:
+    image: postgres:15-alpine
+    depends_on:
+      supabase-auth:
+        condition: service_healthy
+    volumes:
+      - ./supabase/docker/init/01-app-schema.sql:/app-schema.sql:ro
+    entrypoint:
+      - sh
+      - -c
+      - |
+        echo '⏳ Waiting for auth.users table (GoTrue migration)...'
+        until PGPASSWORD=postgres psql -h supabase-db -U postgres -d postgres \
+          -c 'SELECT 1 FROM auth.users LIMIT 0' 2>/dev/null; do
+          sleep 2
+        done
+        echo '✅ auth.users ready — applying app schema...'
+        PGPASSWORD=postgres psql -h supabase-db -U postgres -d postgres -f /app-schema.sql
+        echo '🎉 Migration complete!'
+    networks:
+      - app-network
+    restart: "no"
+
+  # ── Seed Runner (one-shot) ─────────────────────────────────────
+  # Creates a demo user for local development
+  supabase-seed:
+    image: alpine:3.19
+    depends_on:
+      supabase-migration:
+        condition: service_completed_successfully
+    volumes:
+      - ./supabase/docker/seed.sh:/seed.sh:ro
+    entrypoint: ["sh", "/seed.sh"]
+    networks:
+      - app-network
+    restart: "no"
+
+  # ─────────────────────────────────────────────────────────────
+  #  APPLICATION SERVICES
+  # ─────────────────────────────────────────────────────────────
+
+  # ── Frontend — Next.js ─────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+      - /app/.next
+    ports:
+      - "${PORT_FRONTEND:-3000}:3000"
+    environment:
+      - NEXT_PUBLIC_SUPABASE_URL=http://localhost:${PORT_SUPABASE:-54321}
+      - NEXT_PUBLIC_SUPABASE_ANON_KEY=eyJhbGciOiAiSFMyNTYiLCAidHlwIjogIkpXVCJ9.eyJyb2xlIjogImFub24iLCAiaXNzIjogInN1cGFiYXNlLWRlbW8iLCAiaWF0IjogMTY0MTc2OTIwMCwgImV4cCI6IDE3OTk1MzU2MDB9.lANSUgHP9T6xsyLGK5e_-ik8iUqEmjWyzFa4Xl9M8tI
+      - NEXT_PUBLIC_API_URL=http://localhost:${PORT_BACKEND:-8000}
+      # Internal Supabase URL for server-side rendering (inside Docker)
+      - SUPABASE_URL=http://supabase-gateway
+    command: npm run dev
+    depends_on:
+      supabase-gateway:
+        condition: service_healthy
+      backend:
+        condition: service_started
+    networks:
+      - app-network
+
+  # ── Backend — FastAPI ──────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+    volumes:
+      - ./backend:/app
+    ports:
+      - "${PORT_BACKEND:-8000}:8000"
+    env_file:
+      - ./backend/.env
+    environment:
+      - MCP_SERVER_URL=http://mcp-server:8080
+      - ALLOWED_ORIGINS=["http://localhost:${PORT_FRONTEND:-3000}"]
+    depends_on:
+      supabase-migration:
+        condition: service_completed_successfully
+      mcp-server:
+        condition: service_started
+    networks:
+      - app-network
+
+  # ── MCP Server — Meta Marketing API ─────────────────────────
+  mcp-server:
+    build: ./mcp-server
+    ports:
+      - "${PORT_MCP:-8080}:8080"
+    volumes:
+      - ./mcp-server:/app
+      - ./backend/uploads:/shared-uploads:ro
+    environment:
+      TAVILY_API_KEY: "${TAVILY_API_KEY:-}"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - app-network
+
+# ── Volumes ──────────────────────────────────────────────────
+volumes:
+  supabase-db-data:
+
+networks:
+  app-network:
+    driver: bridge
