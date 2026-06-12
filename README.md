@@ -8,7 +8,3 @@ AI-powered Meta Ads management platform. Connect your Facebook Ad Accounts, let 
 cd meta-ads-saas
 docker compose up
 ```
-
-Other directories:
-
-- `nutreoPak-meta-mcp/` — standalone MCP server for NutreoPak Meta integration
