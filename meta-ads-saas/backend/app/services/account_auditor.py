@@ -32,7 +32,7 @@ def _postgrest_url(table: str) -> str:
     return f"{settings.SUPABASE_URL.rstrip('/')}/rest/v1/{table}"
 
 
-async def run_audit(user_id: str, ad_account_id: str | None = None) -> dict:
+async def run_audit(user_id: str, ad_account_id: str | None = None, workspace_id: str | None = None, status_filter: str = "active") -> dict:
     """
     Full audit pipeline:
       1. Resolve ad account + access token
@@ -44,8 +44,10 @@ async def run_audit(user_id: str, ad_account_id: str | None = None) -> dict:
     """
     supabase = get_supabase()
 
-    # 1. Get ad account
+    # 1. Get ad account (scoped to workspace if provided)
     query = supabase.table("ad_accounts").select("*").eq("user_id", user_id).eq("is_active", True)
+    if workspace_id:
+        query = query.eq("workspace_id", workspace_id)
     if ad_account_id:
         query = query.eq("id", ad_account_id)
     result = query.limit(1).execute()
@@ -61,6 +63,8 @@ async def run_audit(user_id: str, ad_account_id: str | None = None) -> dict:
         "created_at": datetime.now(timezone.utc).isoformat(),
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
+    if workspace_id:
+        audit_row["workspace_id"] = workspace_id
     resp = httpx.post(
         _postgrest_url("account_audits"),
         headers=_postgrest_headers(),
@@ -75,9 +79,22 @@ async def run_audit(user_id: str, ad_account_id: str | None = None) -> dict:
     try:
         # 3. Call MCP for ad performance data
         meta_account_id = account["meta_account_id"].replace("act_", "")
+
+        # Resolve workspace page_id to filter audit to this workspace's ads only
+        page_id = None
+        if workspace_id:
+            from ..db.supabase_client import get_supabase as _get_sb
+            ws_result = _get_sb().table("workspaces").select("meta_page_id").eq("id", workspace_id).limit(1).maybe_single().execute()
+            if ws_result.data:
+                page_id = ws_result.data.get("meta_page_id")
+
+        mcp_args: dict = {"ad_account_id": meta_account_id, "date_preset": "maximum", "status_filter": status_filter}
+        if page_id:
+            mcp_args["page_id"] = page_id
+        print(f"[AUDIT] workspace={workspace_id}, page_id={page_id}, mcp_args={mcp_args}", flush=True)
         mcp_result = await mcp_client.call_tool(
             "get_account_audit_data",
-            {"ad_account_id": meta_account_id},
+            mcp_args,
             account["access_token"],
         )
 
@@ -90,8 +107,11 @@ async def run_audit(user_id: str, ad_account_id: str | None = None) -> dict:
         else:
             ad_data = mcp_result
 
-        ads = ad_data.get("ads", [])
-        total_spend = ad_data.get("total_spend", 0)
+        all_ads = ad_data.get("ads", [])
+        # Include all ads that had spend in the period (active, paused, completed)
+        # Only exclude deleted/archived with zero spend
+        ads = [a for a in all_ads if a.get("spend", 0) > 0 or a.get("effective_status", "ACTIVE") == "ACTIVE"]
+        total_spend = sum(a.get("spend", 0) for a in ads)
         dominant_type = ad_data.get("dominant_result_type", "purchases")
 
         # Calculate dynamic baselines from historical data
@@ -99,28 +119,28 @@ async def run_audit(user_id: str, ad_account_id: str | None = None) -> dict:
             meta_account_id, account["access_token"], user_id=user_id
         )
 
-        # Evaluate every ad against baselines
+        # Evaluate every ad against baselines (multi-factor scoring)
         evaluated_ads = [evaluate_ad(a, baselines) for a in ads]
 
-        winning = [a for a in evaluated_ads if a.get("verdict") == "scale"][:10]
-        losing = [a for a in evaluated_ads if a.get("verdict") in ("underperforming", "kill", "no_results")][:10]
+        # Sort all ads by score descending
+        evaluated_ads.sort(key=lambda a: -(a.get("score", 0)))
 
-        # Sort winners: leads by CPL asc, purchases by ROAS desc
-        if dominant_type == "leads":
-            winning.sort(key=lambda a: a.get("cost_per_result") or 9999)
-            losing.sort(key=lambda a: -(a.get("cost_per_result") or 0))
-        else:
-            winning.sort(key=lambda a: -(a.get("roas") or 0))
-            losing.sort(key=lambda a: a.get("roas") or 9999)
+        winning = [a for a in evaluated_ads if a.get("verdict") == "scale"][:10]
+        holding = [a for a in evaluated_ads if a.get("verdict") == "hold"][:10]
+        losing = [a for a in evaluated_ads if a.get("verdict") in ("underperforming", "kill")][:10]
+        learning_ads = [a for a in evaluated_ads if a.get("verdict") == "learning"][:10]
 
         avg_roas = ad_data.get("avg_roas")
         demographics = ad_data.get("demographics")
 
-        # 4. Generate AI strategy report (with diagnostics + baselines)
+        # 4. Compute data-driven health score, then pass to AI for analysis
+        health_score, health_breakdown = _calculate_health_score(evaluated_ads, total_spend)
         report, tone_recommendation = await _generate_strategy_report(
             evaluated_ads, total_spend, avg_roas, winning, losing, demographics,
             dominant_type=dominant_type,
             baselines=baselines,
+            health_score=health_score,
+            health_breakdown=health_breakdown,
         )
 
         # Strip evaluation dicts before serializing (frontend doesn't need raw eval)
@@ -128,13 +148,19 @@ async def run_audit(user_id: str, ad_account_id: str | None = None) -> dict:
             return json.dumps([{k: v for k, v in a.items() if k != "evaluation"} for a in ad_list])
 
         # 5. Update audit row with results
+        # Save ALL evaluated ads in winning_ads (frontend categorizes by verdict/score)
+        # losing_ads gets underperformers for backward compat with AI report prompt
         update = {
             "total_spend": total_spend,
             "roas": avg_roas,
-            "winning_ads": _clean_for_json(winning),
+            "winning_ads": _clean_for_json(evaluated_ads),
             "losing_ads": _clean_for_json(losing),
             "ai_strategy_report": report,
-            "baselines": json.dumps(baselines.to_dict()),
+            "baselines": json.dumps({
+                **baselines.to_dict(),
+                "health_score": health_score,
+                "health_breakdown": health_breakdown,
+            }),
             "status": "completed",
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
@@ -165,6 +191,76 @@ async def run_audit(user_id: str, ad_account_id: str | None = None) -> dict:
         raise
 
 
+def _calculate_health_score(evaluated_ads: list[dict], total_spend: float) -> tuple[int, dict]:
+    """
+    Formula-based account health score (1-10).
+
+    Components:
+      - Performance distribution (40%): spend-weighted % on scale/hold vs underperforming/kill
+      - Weighted avg ad score (30%): spend-weighted average of ad scores (0-100) → 0-10
+      - Efficiency (20%): % of spend that produced at least 1 result
+      - Fatigue (10%): average frequency across ads (lower = healthier)
+
+    Returns (score 1-10, breakdown dict).
+    """
+    if not evaluated_ads or total_spend <= 0:
+        return 1, {"performance": 0, "avg_score": 0, "efficiency": 0, "fatigue": 0, "detail": "No active ad data"}
+
+    # 1. Performance distribution (0-4): % of spend on scale+hold ads
+    scale_spend = sum(a.get("spend", 0) for a in evaluated_ads if a.get("verdict") == "scale")
+    hold_spend = sum(a.get("spend", 0) for a in evaluated_ads if a.get("verdict") == "hold")
+    under_spend = sum(a.get("spend", 0) for a in evaluated_ads if a.get("verdict") in ("underperforming", "kill"))
+    good_pct = (scale_spend + hold_spend) / total_spend if total_spend > 0 else 0
+    # Scale ads count double: 100% scale = 4.0, 100% hold = 3.0, 100% underperforming = 0
+    scale_pct = scale_spend / total_spend if total_spend > 0 else 0
+    performance = min(4.0, good_pct * 3.0 + scale_pct * 1.0)
+
+    # 2. Spend-weighted avg ad score (0-3): maps 0-100 score range to 0-3
+    weighted_sum = sum(a.get("score", 50) * a.get("spend", 0) for a in evaluated_ads)
+    weighted_avg = weighted_sum / total_spend if total_spend > 0 else 50
+    avg_score = (weighted_avg / 100) * 3.0
+
+    # 3. Efficiency (0-2): % of spend producing results
+    productive_spend = sum(a.get("spend", 0) for a in evaluated_ads if a.get("results", 0) > 0)
+    efficiency_pct = productive_spend / total_spend if total_spend > 0 else 0
+    efficiency = efficiency_pct * 2.0
+
+    # 4. Fatigue (0-1): avg frequency — 1-2 = full marks, >4 = 0
+    frequencies = []
+    for a in evaluated_ads:
+        if a.get("spend", 0) > 5:
+            f = float(a.get("frequency", 1))
+            reach = a.get("reach", 0)
+            if reach > 0:
+                f = max(f, a.get("impressions", 0) / reach)
+            frequencies.append(f)
+    avg_freq = sum(frequencies) / len(frequencies) if frequencies else 1.5
+    if avg_freq <= 2.0:
+        fatigue = 1.0
+    elif avg_freq <= 3.5:
+        fatigue = 1.0 - (avg_freq - 2.0) / 1.5 * 0.7
+    else:
+        fatigue = max(0, 0.3 - (avg_freq - 3.5) * 0.15)
+
+    raw = performance + avg_score + efficiency + fatigue
+    score = max(1, min(10, round(raw)))
+
+    breakdown = {
+        "performance": round(performance, 2),
+        "avg_score": round(avg_score, 2),
+        "efficiency": round(efficiency, 2),
+        "fatigue": round(fatigue, 2),
+        "raw_total": round(raw, 2),
+        "detail": (
+            f"{scale_pct*100:.0f}% spend on Scale ads, "
+            f"{good_pct*100:.0f}% on Scale+Hold, "
+            f"{efficiency_pct*100:.0f}% spend producing results, "
+            f"avg frequency {avg_freq:.1f}"
+        ),
+    }
+    return score, breakdown
+
+
 async def _generate_strategy_report(
     ads: list[dict],
     total_spend: float,
@@ -174,6 +270,8 @@ async def _generate_strategy_report(
     demographics: dict | None = None,
     dominant_type: str = "purchases",
     baselines: "AccountBaselines | None" = None,
+    health_score: int = 5,
+    health_breakdown: dict | None = None,
 ) -> tuple[str, str | None]:
     """Use OpenAI to generate a strategic analysis. Returns (report, tone_recommendation)."""
 
@@ -196,7 +294,7 @@ Analyze these demographics to understand WHO is converting and recommend targeti
         win_str = f"{bl['win_threshold']:.2f}" if bl['win_threshold'] else "N/A"
         lose_str = f"{bl['lose_threshold']:.2f}" if bl['lose_threshold'] else "N/A"
         baselines_section = f"""
-## Account Historical Baselines (30-day averages)
+## Account Historical Baselines (Last 30 days)
 - Source: {baselines.source}
 - Avg CPL: ${bl['avg_cpl'] or 'N/A'}
 - Avg CPA: ${bl['avg_cpa'] or 'N/A'}
@@ -218,11 +316,17 @@ IMPORTANT: Use these baselines to judge each ad. "Winning" = 20% better than bas
             diag = build_diagnostic_prompt(ad, baselines)
             if diag != "Insufficient data for comparison.":
                 diag_parts.append(f"  - **{name}** (Winner): {diag}")
+            diagnosis = ad.get("diagnosis", "")
+            if diagnosis:
+                diag_parts.append(f"    Root cause: {diagnosis}")
         for ad in losing[:5]:
             name = ad.get("ad_name", ad.get("ad_id", "?"))
             diag = build_diagnostic_prompt(ad, baselines)
             if diag != "Insufficient data for comparison.":
                 diag_parts.append(f"  - **{name}** (Loser): {diag}")
+            diagnosis = ad.get("diagnosis", "")
+            if diagnosis:
+                diag_parts.append(f"    Root cause: {diagnosis}")
         if diag_parts:
             diagnostics_section = "\n## Per-Ad Diagnostic Context\n" + "\n".join(diag_parts)
 
@@ -247,7 +351,16 @@ IMPORTANT: Use these baselines to judge each ad. "Winning" = 20% better than bas
 - Losing Ads ({lose_label} or no purchases): {len(losing)}"""
         metric_note = "Use ROAS as the primary metric. Higher ROAS = better. Judge relative to account baseline, NOT arbitrary fixed thresholds."
 
-    prompt = f"""You are an expert Meta Ads strategist. Analyze this account's last 30 days of ad performance and provide actionable recommendations.
+    health_detail = (health_breakdown or {}).get("detail", "")
+    health_label = (
+        "Excellent" if health_score >= 9 else
+        "Strong" if health_score >= 7 else
+        "Moderate" if health_score >= 5 else
+        "Needs Work" if health_score >= 3 else
+        "Critical"
+    )
+
+    prompt = f"""You are an expert Meta Ads strategist. Analyze this account's lifetime ad performance data and provide actionable recommendations.
 
 ## Account Data
 - Total Spend: ${total_spend:.2f}
@@ -257,13 +370,17 @@ IMPORTANT: Use these baselines to judge each ad. "Winning" = 20% better than bas
 {demo_section}
 {diagnostics_section}
 
+## Pre-Computed Account Health Score: {health_score}/10 ({health_label})
+Breakdown: {health_detail}
+This score is calculated from: performance distribution (spend on Scale vs Underperforming ads), spend-weighted avg ad score, efficiency (% spend producing results), and ad fatigue (frequency).
+
 NOTE: {metric_note}
 
 ## Ad Performance Data
 {ads_summary}
 
 ## Your Report Must Include:
-1. **Account Health Score** (1-10) with brief justification
+1. **Account Health Score** — The score is **{health_score}/10 ({health_label})**. Do NOT invent a different score. Start your report with this exact score, then explain WHY the account earned this score using the breakdown data and ad performance.
 2. **Top Performing Ads** — what makes them work (creative patterns, targeting signals). Compare to account baselines.
 3. **Underperforming Ads** — diagnose WHY using both primary metric AND secondary metrics (CTR, CPM, CPC). Is it a creative problem (low CTR), an audience problem (high CPM), or a landing page problem (clicks but no results)?
 4. **Budget Reallocation** — specific recommendations on where to shift spend
@@ -276,16 +393,24 @@ IMPORTANT: At the very end of your response, on its own line, write:
 TONE_RECOMMENDATION: <one of: professional, humorous, educational, promotional>
 Choose the tone that would best fit this account's audience and top-performing content patterns."""
 
-    response = await openai_client.chat.completions.create(
-        model=settings.CHEAP_FAST_MODEL,
-        messages=[
-            {"role": "system", "content": "You are a Meta Ads performance analyst. Be concise, data-driven, and actionable."},
-            {"role": "user", "content": prompt},
-        ],
-        max_completion_tokens=4000,
-    )
-    full_text = (response.choices[0].message.content or "").strip()
+    try:
+        response = await openai_client.chat.completions.create(
+            model=settings.CHEAP_FAST_MODEL,
+            messages=[
+                {"role": "system", "content": "You are a Meta Ads performance analyst. Be concise, data-driven, and actionable."},
+                {"role": "user", "content": prompt},
+            ],
+            max_completion_tokens=4000,
+        )
+        full_text = (response.choices[0].message.content or "").strip()
+        logger.info("Strategy report: model=%s, finish_reason=%s, len=%d",
+                     settings.CHEAP_FAST_MODEL, response.choices[0].finish_reason, len(full_text))
+    except Exception as e:
+        logger.error("OpenAI strategy report call failed: %s", e)
+        return f"Strategy report generation failed: {e}", None
     if not full_text:
+        logger.warning("OpenAI returned empty content for strategy report (finish_reason=%s)",
+                        response.choices[0].finish_reason)
         return "Strategy report generation returned empty. Please re-run the audit.", None
 
     # Extract tone recommendation from end of response
@@ -324,11 +449,11 @@ async def generate_audit_proposals(user_id: str, audit_id: str) -> list[dict]:
     if audit["status"] != "completed":
         raise ValueError("Audit is not completed")
 
-    # Load ad account for meta_account_id
+    # Load ad account using the audit's ad_account_id (workspace-safe)
     account_result = (
         supabase.table("ad_accounts")
         .select("id, meta_account_id, access_token")
-        .eq("user_id", user_id)
+        .eq("id", audit["ad_account_id"])
         .eq("is_active", True)
         .limit(1)
         .execute()
@@ -363,7 +488,7 @@ async def generate_audit_proposals(user_id: str, audit_id: str) -> list[dict]:
     if isinstance(losing, str):
         losing = json.loads(losing)
 
-    prompt = f"""You are a Meta Ads optimization expert. Based on this 30-day audit report and ad data, generate SPECIFIC, EXECUTABLE optimization proposals.
+    prompt = f"""You are a Meta Ads optimization expert. Based on this lifetime audit report and ad data, generate SPECIFIC, EXECUTABLE optimization proposals.
 
 ## Strategy Report (AI-generated):
 {report[:3000]}
@@ -438,12 +563,7 @@ Return ONLY a JSON array — no markdown, no wrapper."""
     if not proposals:
         return []
 
-    # Clear old audit-sourced pending proposals
-    supabase.table("optimization_proposals").delete().eq(
-        "user_id", user_id
-    ).eq("ad_account_id", ad_account_id).eq("status", "pending").execute()
-
-    # Save proposals
+    # Save proposals (keep existing — user can reject unwanted ones)
     valid_actions = {
         "increase_budget", "decrease_budget", "pause", "enable",
         "reallocate", "audience_shift", "custom",

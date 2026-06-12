@@ -1,7 +1,8 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useCallback } from "react";
 import { useParams, useSearchParams, useRouter } from "next/navigation";
+import { useAutoRefresh } from "@/hooks/useAutoRefresh";
 import {
   ArrowLeft,
   Loader2,
@@ -14,6 +15,7 @@ import {
   Sparkles,
   Activity,
   Crosshair,
+  Download,
 } from "lucide-react";
 import DateRangePicker, { type DateRangeValue } from "@/components/DateRangePicker";
 import {
@@ -127,6 +129,7 @@ type Ad = {
   status: string;
   effective_status: string;
   thumbnail_url: string | null;
+  lead_gen_form_id: string | null;
   spend: number;
   impressions: number;
   ctr: number;
@@ -214,7 +217,7 @@ export default function CampaignDetailPage() {
   const campaignId = params.id as string;
   const adAccountId = searchParams.get("ad_account_id") || "";
 
-  const [datePreset, setDatePreset] = useState("last_7d");
+  const [datePreset, setDatePreset] = useState("maximum");
   const [since, setSince] = useState<string | undefined>();
   const [until, setUntil] = useState<string | undefined>();
   const [data, setData] = useState<CampaignDetail | null>(null);
@@ -254,6 +257,17 @@ export default function CampaignDetailPage() {
       });
     return () => { cancelled = true; };
   }, [campaignId, adAccountId, datePreset, since, until]);
+
+  const refreshDetail = useCallback(() => {
+    if (!campaignId || !adAccountId) return;
+    api.getCampaignDetail(adAccountId, campaignId, datePreset, since, until)
+      .then((res: { data: CampaignDetail }) => {
+        const d = (res as { data: CampaignDetail }).data ?? res;
+        setData(d);
+      })
+      .catch(() => { /* silent refresh */ });
+  }, [campaignId, adAccountId, datePreset, since, until]);
+  useAutoRefresh(refreshDetail, !!campaignId && !!adAccountId);
 
   const s = data?.summary;
   const rm = getResultMeta(s?.result_type || "none");
@@ -721,13 +735,37 @@ export default function CampaignDetailPage() {
                               </span>
                             </td>
                             <td className="py-3 px-2 text-right">
-                              <button
-                                onClick={() => router.push(`/dashboard/copilot?ad_id=${ad.id}&campaign_id=${campaignId}&ad_name=${encodeURIComponent(ad.name)}`)}
-                                className="flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-medium bg-violet-500/10 text-violet-400 hover:bg-violet-500/20 border border-violet-500/20 transition-all"
-                              >
-                                <Sparkles className="w-3 h-3" />
-                                AI
-                              </button>
+                              <div className="flex items-center gap-1.5 justify-end">
+                                {ad.lead_gen_form_id && (
+                                  <button
+                                    onClick={async () => {
+                                      try {
+                                        const res = await api.downloadLeadsCsv(ad.lead_gen_form_id!);
+                                        const url = window.URL.createObjectURL(new Blob([res.data]));
+                                        const a = document.createElement("a");
+                                        a.href = url;
+                                        a.download = `leads_${ad.lead_gen_form_id}.csv`;
+                                        a.click();
+                                        window.URL.revokeObjectURL(url);
+                                      } catch {
+                                        alert("No leads found or download failed.");
+                                      }
+                                    }}
+                                    title="Download Leads CSV"
+                                    className="flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-medium bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20 border border-emerald-500/20 transition-all"
+                                  >
+                                    <Download className="w-3 h-3" />
+                                    Leads
+                                  </button>
+                                )}
+                                <button
+                                  onClick={() => router.push(`/dashboard/copilot?filter_ad_id=${ad.id}&ad_id=${ad.id}&campaign_id=${campaignId}&ad_name=${encodeURIComponent(ad.name)}`)}
+                                  className="flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-medium bg-violet-500/10 text-violet-400 hover:bg-violet-500/20 border border-violet-500/20 transition-all"
+                                >
+                                  <Sparkles className="w-3 h-3" />
+                                  AI
+                                </button>
+                              </div>
                             </td>
                           </tr>
                         );

@@ -13,7 +13,7 @@ from email.mime.text import MIMEText
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, EmailStr
 
-from ...api.deps import get_current_user_id
+from ...api.deps import get_current_user_id, get_workspace_id
 from ...core.config import get_settings
 from ...db.supabase_client import get_supabase
 from ...services.mcp_client import mcp_client, MCPError
@@ -25,16 +25,19 @@ router = APIRouter(prefix="/meta", tags=["Meta Pixel"])
 
 
 @router.get("/pixels")
-async def list_pixels(user_id: str = Depends(get_current_user_id)):
+async def list_pixels(
+    user_id: str = Depends(get_current_user_id),
+    workspace_id: str = Depends(get_workspace_id),
+):
     """
-    List all Meta Pixels available across all of the user's active ad accounts.
+    List all Meta Pixels available across all of the workspace's active ad accounts.
     Calls the MCP server's fetch_ad_account_pixels tool for each account.
     """
     supabase = get_supabase()
     account_result = (
         supabase.table("ad_accounts")
         .select("meta_account_id, access_token")
-        .eq("user_id", user_id)
+        .eq("workspace_id", workspace_id)
         .eq("is_active", True)
         .neq("access_token", "")
         .execute()
@@ -78,7 +81,11 @@ async def list_pixels(user_id: str = Depends(get_current_user_id)):
 
 
 @router.get("/pixels/{pixel_id}/events")
-async def get_pixel_events(pixel_id: str, user_id: str = Depends(get_current_user_id)):
+async def get_pixel_events(
+    pixel_id: str,
+    user_id: str = Depends(get_current_user_id),
+    workspace_id: str = Depends(get_workspace_id),
+):
     """
     Fetch active conversion events recorded by a specific Meta Pixel.
     Returns events with recent activity (last 7 days).
@@ -87,7 +94,7 @@ async def get_pixel_events(pixel_id: str, user_id: str = Depends(get_current_use
     account_result = (
         supabase.table("ad_accounts")
         .select("access_token")
-        .eq("user_id", user_id)
+        .eq("workspace_id", workspace_id)
         .eq("is_active", True)
         .neq("access_token", "")
         .limit(5)
@@ -121,8 +128,64 @@ async def get_pixel_events(pixel_id: str, user_id: str = Depends(get_current_use
     return {"pixel_id": pixel_id, "events": []}
 
 
+# Meta OAuth error fingerprints — when these appear in an upstream error,
+# the workspace's Meta access token has been invalidated and the user has
+# to re-authenticate. Code 190 + subcodes 458 (app expired), 459 (user must
+# re-login), 460 (password changed), 463 (token expired), 467 (invalid
+# token). We classify any of these as "expired" so the frontend can route
+# the user to the OAuth flow instead of showing a raw 502.
+_META_TOKEN_EXPIRED_FINGERPRINTS = (
+    "code\":190",   "code: 190",   "(#190)",
+    "subcode 458",  "subcode 459", "subcode 460",
+    "subcode 463",  "subcode 467",
+    "expired or invalid",
+    "the user needs to re-authenticate",
+    "session has expired",
+)
+
+
+def _is_meta_token_expired(err_text: str) -> bool:
+    if not err_text:
+        return False
+    s = err_text.lower()
+    return any(fp.lower() in s for fp in _META_TOKEN_EXPIRED_FINGERPRINTS)
+
+
+def _mark_account_token_expired(supabase, account_id: str) -> None:
+    """Hook for tracking which accounts have stale tokens.
+
+    NOTE — we deliberately do NOT flip ``is_active=false`` here. Other routes
+    (and this same /identities route) filter the workspace's ad_accounts by
+    ``is_active=true``; flipping the flag would cause subsequent calls to
+    return "no active ad account" instead of the structured 401 we want.
+    The 401 + META_TOKEN_EXPIRED code is sufficient signal on its own — the
+    frontend uses it to drive the Reconnect CTA. If we later add an explicit
+    ``token_expired_at`` column we can record that here without affecting
+    the active-account lookup."""
+    return  # no-op for now; keeps account active so routes resolve cleanly
+
+
+def _token_expired_response() -> HTTPException:
+    """Standard 401 payload when Meta says the token is dead. The frontend
+    detects ``code='META_TOKEN_EXPIRED'`` and routes the user to OAuth."""
+    return HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail={
+            "code": "META_TOKEN_EXPIRED",
+            "message": (
+                "Your Meta connection has expired. Reconnect your Meta "
+                "account to continue."
+            ),
+            "reconnect_path": "/api/v1/oauth/meta/authorize",
+        },
+    )
+
+
 @router.get("/identities")
-async def fetch_social_identities(user_id: str = Depends(get_current_user_id)):
+async def fetch_social_identities(
+    user_id: str = Depends(get_current_user_id),
+    workspace_id: str = Depends(get_workspace_id),
+):
     """
     Fetch Facebook Pages + linked Instagram Business Accounts via MCP.
     Saves facebook_page_id and instagram_actor_id to the ad_accounts row.
@@ -131,7 +194,7 @@ async def fetch_social_identities(user_id: str = Depends(get_current_user_id)):
     account_result = (
         supabase.table("ad_accounts")
         .select("id, meta_account_id, access_token")
-        .eq("user_id", user_id)
+        .eq("workspace_id", workspace_id)
         .eq("is_active", True)
         .limit(1)
         .execute()
@@ -151,7 +214,11 @@ async def fetch_social_identities(user_id: str = Depends(get_current_user_id)):
         )
         parsed = _parse_mcp_json(result)
         if isinstance(parsed, dict) and "error" in parsed:
-            raise HTTPException(status_code=502, detail=parsed["error"])
+            err_text = str(parsed["error"])
+            if _is_meta_token_expired(err_text):
+                _mark_account_token_expired(supabase, account["id"])
+                raise _token_expired_response()
+            raise HTTPException(status_code=502, detail=err_text)
 
         pages = parsed.get("pages", []) if isinstance(parsed, dict) else []
 
@@ -172,11 +239,64 @@ async def fetch_social_identities(user_id: str = Depends(get_current_user_id)):
                     logger.warning("Failed to save social identities: %s", e)
 
         return {"pages": pages}
+    except HTTPException:
+        raise
+    except MCPError as e:
+        if _is_meta_token_expired(str(e)):
+            _mark_account_token_expired(supabase, account["id"])
+            raise _token_expired_response()
+        raise HTTPException(status_code=502, detail=f"MCP error: {e}")
+    except Exception as e:
+        if _is_meta_token_expired(str(e)):
+            _mark_account_token_expired(supabase, account["id"])
+            raise _token_expired_response()
+        logger.error("Social identities fetch failed: %s", e)
+        raise HTTPException(status_code=502, detail=f"Failed to fetch social profiles: {e}")
+
+
+@router.get("/whatsapp-status")
+async def check_whatsapp_status(
+    user_id: str = Depends(get_current_user_id),
+    workspace_id: str = Depends(get_workspace_id),
+):
+    """
+    Check if the connected Facebook Page has a WhatsApp number wired up.
+    Determines whether Click-to-WhatsApp ads will run natively or fall back to wa.me traffic.
+    """
+    supabase = get_supabase()
+    account_result = (
+        supabase.table("ad_accounts")
+        .select("access_token, facebook_page_id")
+        .eq("workspace_id", workspace_id)
+        .eq("is_active", True)
+        .limit(1)
+        .execute()
+    )
+    if not account_result.data:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No active ad account found. Connect a Meta account first.",
+        )
+
+    account = account_result.data[0]
+    page_id = account.get("facebook_page_id") or ""
+    if not page_id:
+        return {
+            "connected": False,
+            "reason": "No Facebook Page linked — connect one in settings first",
+        }
+
+    try:
+        result = await mcp_client.check_page_whatsapp(page_id, account["access_token"])
+        parsed = _parse_mcp_json(result)
+        if isinstance(parsed, dict) and "error" in parsed and "connected" not in parsed:
+            raise HTTPException(status_code=502, detail=parsed["error"])
+        return parsed
     except MCPError as e:
         raise HTTPException(status_code=502, detail=f"MCP error: {e}")
     except Exception as e:
-        logger.error("Social identities fetch failed: %s", e)
-        raise HTTPException(status_code=502, detail=f"Failed to fetch social profiles: {e}")
+        logger.error("WhatsApp status check failed: %s", e)
+        raise HTTPException(status_code=502, detail=f"Failed to check WhatsApp status: {e}")
 
 
 class CreatePixelRequest(BaseModel):
@@ -187,13 +307,14 @@ class CreatePixelRequest(BaseModel):
 async def create_pixel(
     body: CreatePixelRequest,
     user_id: str = Depends(get_current_user_id),
+    workspace_id: str = Depends(get_workspace_id),
 ):
     """Create a new Meta Pixel and auto-save it to the ad account."""
     supabase = get_supabase()
     account_result = (
         supabase.table("ad_accounts")
         .select("id, meta_account_id, access_token")
-        .eq("user_id", user_id)
+        .eq("workspace_id", workspace_id)
         .eq("is_active", True)
         .limit(1)
         .execute()
@@ -221,25 +342,46 @@ async def create_pixel(
         if not pixel_id:
             raise HTTPException(status_code=502, detail="Pixel creation failed — no ID returned")
 
-        # Auto-save to ad_accounts
-        try:
-            supabase.table("ad_accounts").update({"pixel_id": pixel_id}).eq("id", account["id"]).execute()
-        except Exception as e:
-            logger.warning("Auto-save pixel_id failed: %s", e)
+    except (MCPError, HTTPException) as e:
+        error_msg = str(e.detail if isinstance(e, HTTPException) else e)
+        # Meta error #6200: pixel already exists → fetch existing pixel instead
+        if "already exists" in error_msg or "6200" in error_msg:
+            logger.info("Pixel already exists on account %s — fetching existing pixel", meta_id)
+            try:
+                existing = await mcp_client.call_tool(
+                    "fetch_ad_account_pixels",
+                    {"ad_account_id": meta_id},
+                    account["access_token"],
+                )
+                existing_parsed = _parse_mcp_json(existing)
+                pixels = existing_parsed if isinstance(existing_parsed, list) else existing_parsed.get("pixels", [])
+                if pixels:
+                    pixel_id = pixels[0].get("id")
+                    parsed = {"pixel_id": pixel_id, "name": pixels[0].get("name", body.pixel_name), "already_existed": True}
+                else:
+                    raise HTTPException(status_code=502, detail="Pixel exists but could not be fetched")
+            except MCPError as fetch_err:
+                raise HTTPException(status_code=502, detail=f"Failed to fetch existing pixel: {fetch_err}")
+        else:
+            raise HTTPException(status_code=502, detail=f"MCP error: {error_msg}")
 
-        # Update tracking mode
-        try:
-            prefs_result = supabase.table("user_preferences").select("id").eq("user_id", user_id).limit(1).execute()
-            if prefs_result.data:
-                supabase.table("user_preferences").update({"tracking_mode": "website_pixel"}).eq("user_id", user_id).execute()
-            else:
-                supabase.table("user_preferences").insert({"user_id": user_id, "tracking_mode": "website_pixel"}).execute()
-        except Exception as e:
-            logger.warning("tracking_mode update skipped: %s", e)
+    # Auto-save to ad_accounts
+    try:
+        supabase.table("ad_accounts").update({"pixel_id": pixel_id}).eq("id", account["id"]).execute()
+    except Exception as e:
+        logger.warning("Auto-save pixel_id failed: %s", e)
 
-        return parsed
-    except MCPError as e:
-        raise HTTPException(status_code=502, detail=f"MCP error: {e}")
+    # Update tracking mode
+    try:
+        prefs_result = supabase.table("user_preferences").select("id").eq("user_id", user_id).limit(1).execute()
+        if prefs_result.data:
+            supabase.table("user_preferences").update({"tracking_mode": "website_pixel"}).eq("user_id", user_id).execute()
+        else:
+            supabase.table("user_preferences").insert({"user_id": user_id, "tracking_mode": "website_pixel"}).execute()
+    except Exception as e:
+        logger.warning("tracking_mode update skipped: %s", e)
+
+    return parsed
 
 
 class SavePixelRequest(BaseModel):
@@ -250,6 +392,7 @@ class SavePixelRequest(BaseModel):
 async def save_pixel(
     body: SavePixelRequest,
     user_id: str = Depends(get_current_user_id),
+    workspace_id: str = Depends(get_workspace_id),
 ):
     """
     Save (or clear) the selected Meta Pixel ID.
@@ -265,7 +408,7 @@ async def save_pixel(
         account_result = (
             supabase.table("ad_accounts")
             .update({"pixel_id": body.pixel_id})
-            .eq("user_id", user_id)
+            .eq("workspace_id", workspace_id)
             .eq("is_active", True)
             .execute()
         )
@@ -406,6 +549,7 @@ fbq('track', 'Purchase', {{
 async def email_developer(
     body: EmailDeveloperRequest,
     user_id: str = Depends(get_current_user_id),
+    workspace_id: str = Depends(get_workspace_id),
 ):
     """
     Send pixel installation instructions to a developer via email.

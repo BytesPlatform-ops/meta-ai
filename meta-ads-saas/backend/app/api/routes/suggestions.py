@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
-from ...api.deps import get_current_user_id
+from ...api.deps import get_current_user_id, get_workspace_id
 from ...db.supabase_client import get_supabase
 from ...services.optimization_engine import run_optimization, execute_suggestion
 from ...services.mcp_client import MCPError
@@ -23,13 +23,16 @@ router = APIRouter(prefix="/suggestions", tags=["Campaign Suggestions"])
 # ── Analyze Now ───────────────────────────────────────────────────────────────
 
 @router.post("/analyze-now")
-async def analyze_now(user_id: str = Depends(get_current_user_id)):
+async def analyze_now(
+    user_id: str = Depends(get_current_user_id),
+    workspace_id: str = Depends(get_workspace_id),
+):
     """
     Manually trigger the AI optimization engine.
     Fetches fresh data via MCP, generates LLM suggestions, saves as PENDING.
     """
     try:
-        suggestions = await run_optimization(user_id)
+        suggestions = await run_optimization(user_id, workspace_id=workspace_id)
         return {
             "success": True,
             "suggestions_count": len(suggestions),
@@ -48,13 +51,14 @@ async def analyze_now(user_id: str = Depends(get_current_user_id)):
 async def list_suggestions(
     status_filter: str = "PENDING",
     user_id: str = Depends(get_current_user_id),
+    workspace_id: str = Depends(get_workspace_id),
 ):
     """List suggestions for the current user, filtered by status."""
     supabase = get_supabase()
     query = (
         supabase.table("campaign_suggestions")
         .select("*")
-        .eq("user_id", user_id)
+        .eq("workspace_id", workspace_id)
         .order("created_at", desc=True)
     )
     if status_filter != "all":
@@ -74,6 +78,7 @@ class ResolveSuggestionRequest(BaseModel):
 async def resolve_suggestion(
     body: ResolveSuggestionRequest,
     user_id: str = Depends(get_current_user_id),
+    workspace_id: str = Depends(get_workspace_id),
 ):
     """
     Approve or reject a suggestion.
@@ -93,7 +98,7 @@ async def resolve_suggestion(
         supabase.table("campaign_suggestions")
         .select("*, ad_accounts!campaign_suggestions_ad_account_id_fkey(access_token, meta_account_id)")
         .eq("id", body.suggestion_id)
-        .eq("user_id", user_id)
+        .eq("workspace_id", workspace_id)
         .eq("status", "PENDING")
         .execute()
     )
@@ -103,7 +108,7 @@ async def resolve_suggestion(
             supabase.table("campaign_suggestions")
             .select("*")
             .eq("id", body.suggestion_id)
-            .eq("user_id", user_id)
+            .eq("workspace_id", workspace_id)
             .eq("status", "PENDING")
             .execute()
         )

@@ -2,6 +2,7 @@
 
 import { useEffect, useState, useCallback } from "react";
 import { api } from "@/lib/api";
+import { useAutoRefresh } from "@/hooks/useAutoRefresh";
 import {
   BarChart3,
   TrendingUp,
@@ -14,6 +15,7 @@ import {
   Activity,
   Eye,
   MousePointerClick,
+  MessageSquare,
   ShoppingCart,
   Pause,
   RefreshCw,
@@ -32,22 +34,28 @@ import { useRouter } from "next/navigation";
 
 /* ── Types ────────────────────────────────────────────────── */
 
+type MetricsData = {
+  spend: number;
+  impressions: number;
+  clicks: number;
+  ctr: number;
+  purchases: number;
+  leads: number;
+  results: number;
+  result_type: string;
+  cost_per_result: number | null;
+  roas: number | null;
+  results_breakdown: Record<string, number>;
+};
+
 type AccountOverview = {
-  name: string;
-  status: string;
+  account_name: string;
   currency: string;
-  timezone: string;
-  lifetime_spend: number;
-  spend_cap: number | null;
   active_campaigns: number;
-  spend_30d: number;
-  roas_30d: number | null;
-  purchases_30d: number;
-  leads_30d: number;
-  results_30d: number;
-  result_type_30d: string;
-  cost_per_result_30d: number;
+  total_account_metrics: MetricsData;
+  workspace_page_metrics: MetricsData | null;
   ad_account_id?: string;
+  page_id?: string | null;
 };
 
 type Campaign = {
@@ -132,7 +140,10 @@ function VerdictBadge({ verdict }: { verdict: string }) {
 
 const RESULT_LABELS: Record<string, { label: string; costLabel: string; isCost: boolean }> = {
   purchases: { label: "Purchases", costLabel: "ROAS", isCost: false },
+  registrations: { label: "Registrations", costLabel: "Cost/Reg", isCost: true },
   leads: { label: "Leads", costLabel: "CPL", isCost: true },
+  add_to_cart: { label: "Add to Cart", costLabel: "Cost/ATC", isCost: true },
+  checkouts: { label: "Checkouts", costLabel: "Cost/Checkout", isCost: true },
   messaging_conversations: { label: "Chats", costLabel: "Cost/Chat", isCost: true },
   messaging_replies: { label: "Replies", costLabel: "Cost/Reply", isCost: true },
   link_clicks: { label: "Clicks", costLabel: "CPC", isCost: true },
@@ -240,7 +251,7 @@ function AdRow({ ad, currency, campaignId }: { ad: Ad; currency: string; campaig
 
       {/* Get Suggestions button */}
       <button
-        onClick={() => router.push(`/dashboard/copilot?ad_id=${ad.id}&campaign_id=${campaignId}&ad_name=${encodeURIComponent(ad.name)}`)}
+        onClick={() => router.push(`/dashboard/copilot?filter_ad_id=${ad.id}&ad_id=${ad.id}&campaign_id=${campaignId}&ad_name=${encodeURIComponent(ad.name)}`)}
         className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-violet-500/10 text-violet-400 hover:bg-violet-500/20 border border-violet-500/20 transition-all shrink-0"
         title="Get AI suggestions for this ad"
       >
@@ -333,7 +344,7 @@ function CampaignCard({
             <p className="text-white font-medium text-[11px]">{budgetStr}</p>
           </div>
           <div className="text-center w-20">
-            <p className="text-gray-600">Spend (7d)</p>
+            <p className="text-gray-600">Spend</p>
             <p className="text-white font-medium">{campaign.spend_7d.toLocaleString()} {currency}</p>
           </div>
           <div className="text-center w-16">
@@ -362,7 +373,7 @@ function CampaignCard({
       {/* Mobile metrics */}
       <div className="lg:hidden grid grid-cols-4 gap-2 px-5 pb-3 text-xs text-gray-400">
         <div>
-          <p className="text-gray-600">Spend (7d)</p>
+          <p className="text-gray-600">Spend</p>
           <p className="text-white font-medium">{campaign.spend_7d.toLocaleString()}</p>
         </div>
         <div>
@@ -409,6 +420,13 @@ function CampaignCard({
                 Pause Campaign
               </button>
             )}
+            <button
+              onClick={() => router.push("/dashboard/copilot")}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-violet-500/10 text-violet-400 hover:bg-violet-500/20 border border-violet-500/20 transition-all"
+            >
+              <Sparkles className="w-3 h-3" />
+              View Proposals
+            </button>
           </div>
 
           {loadingAds ? (
@@ -569,8 +587,8 @@ export default function CampaignsPage() {
     if (!overview) setLoading(true);
     setError(null);
     try {
-      // First get the default overview to discover the ad account ID
-      const { data: overviewData } = await api.getDefaultOverview();
+      // Fetch dashboard metrics (page-filtered if workspace has a page linked)
+      const { data: overviewData } = await api.getDashboardMetrics("maximum");
       setOverview(overviewData);
       setAdAccountId(overviewData.ad_account_id);
       setCurrency(overviewData.currency || "USD");
@@ -628,6 +646,8 @@ export default function CampaignsPage() {
     fetchData();
     fetchPosts();
   }, [fetchData, fetchPosts]);
+
+  useAutoRefresh(() => { sessionStorage.removeItem("campaigns_cache"); fetchData(); fetchPosts(); });
 
   const handlePause = async (campaignId: string) => {
     if (!adAccountId) return;
@@ -702,48 +722,59 @@ export default function CampaignsPage() {
         </div>
       )}
 
-      {/* Account Overview Stats */}
-      {overview && (
-        <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
-          <MetricCard
-            label="Active Campaigns"
-            value={String(overview.active_campaigns)}
-            icon={Target}
-            iconBg="bg-blue-500/10 text-blue-400"
-          />
-          <MetricCard
-            label="Spend (30d)"
-            value={`${overview.spend_30d.toLocaleString()} ${currency}`}
-            icon={DollarSign}
-            iconBg="bg-emerald-500/10 text-emerald-400"
-          />
-          {(() => {
-            const ovMeta = getResultMeta(overview.result_type_30d);
-            return ovMeta.isCost ? (
+      {/* Workspace Overview Stats */}
+      {overview && (() => {
+        // Use page metrics if available, otherwise total account metrics
+        const m = overview.workspace_page_metrics || overview.total_account_metrics;
+        if (!m) return null;
+        const BREAKDOWN_LABELS_MAP: Record<string, { label: string; icon: typeof ShoppingCart; color: string }> = {
+          purchases: { label: "Purchases", icon: ShoppingCart, color: "bg-emerald-500/10 text-emerald-400" },
+          registrations: { label: "Registrations", icon: FileText, color: "bg-indigo-500/10 text-indigo-400" },
+          leads: { label: "Leads", icon: Users, color: "bg-blue-500/10 text-blue-400" },
+          conversations: { label: "Conversations", icon: MessageSquare, color: "bg-purple-500/10 text-purple-400" },
+          replies: { label: "Replies", icon: MessageSquare, color: "bg-pink-500/10 text-pink-400" },
+          clicks: { label: "Clicks", icon: MousePointerClick, color: "bg-amber-500/10 text-amber-400" },
+          page_views: { label: "Page Views", icon: Eye, color: "bg-cyan-500/10 text-cyan-400" },
+        };
+        return (
+          <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
+            <MetricCard
+              label="Active Campaigns"
+              value={String(overview.active_campaigns)}
+              icon={Target}
+              iconBg="bg-blue-500/10 text-blue-400"
+            />
+            <MetricCard
+              label="Spend"
+              value={`${m.spend.toLocaleString()} ${currency}`}
+              icon={DollarSign}
+              iconBg="bg-emerald-500/10 text-emerald-400"
+            />
+            {m.roas != null && m.roas > 0 && (
               <MetricCard
-                label={`${ovMeta.costLabel} (30d)`}
-                value={overview.cost_per_result_30d > 0 ? `${overview.cost_per_result_30d.toFixed(0)} ${currency}` : "—"}
+                label="ROAS"
+                value={`${m.roas.toFixed(2)}x`}
                 icon={TrendingUp}
                 iconBg="bg-violet-500/10 text-violet-400"
+                change={m.roas >= 3 ? "Scaling" : m.roas >= 1.5 ? "Profitable" : undefined}
               />
-            ) : (
-              <MetricCard
-                label="ROAS (30d)"
-                value={overview.roas_30d != null ? `${overview.roas_30d.toFixed(2)}x` : "—"}
-                icon={TrendingUp}
-                iconBg="bg-violet-500/10 text-violet-400"
-                change={overview.roas_30d != null && overview.roas_30d >= 3 ? "Scaling" : overview.roas_30d != null && overview.roas_30d >= 1.5 ? "Profitable" : undefined}
-              />
-            );
-          })()}
-          <MetricCard
-            label={`${getResultMeta(overview.result_type_30d).label} (30d)`}
-            value={String(overview.results_30d)}
-            icon={ShoppingCart}
-            iconBg="bg-amber-500/10 text-amber-400"
-          />
-        </div>
-      )}
+            )}
+            {m.results_breakdown && Object.entries(m.results_breakdown).map(([type, count]) => {
+              const meta = BREAKDOWN_LABELS_MAP[type];
+              if (!meta || count === 0) return null;
+              return (
+                <MetricCard
+                  key={type}
+                  label={`${meta.label}`}
+                  value={String(count)}
+                  icon={meta.icon}
+                  iconBg={meta.color}
+                />
+              );
+            })}
+          </div>
+        );
+      })()}
 
       {/* Verdict Legend */}
       <div className="flex items-center gap-4 mb-4 text-[11px] text-gray-500 flex-wrap">

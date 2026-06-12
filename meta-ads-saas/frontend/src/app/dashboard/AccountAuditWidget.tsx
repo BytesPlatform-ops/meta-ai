@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { useAutoRefresh } from "@/hooks/useAutoRefresh";
 import {
   Activity,
   DollarSign,
@@ -36,9 +37,19 @@ interface AuditAd {
   results: number;
   result_type: string;
   ctr: number;
+  cpc?: number;
+  cpm?: number;
+  frequency?: number;
   cost_per_purchase?: number | null;
   cost_per_lead?: number | null;
   cost_per_result?: number | null;
+  score?: number;
+  verdict?: string;
+  components?: { creative: number; efficiency: number; health: number; maturity: number };
+  days_running?: number | null;
+  is_learning?: boolean;
+  diagnosis?: string;
+  campaign_id?: string;
 }
 
 interface Demographics {
@@ -479,6 +490,7 @@ const ACTION_STYLES: Record<string, { label: string; color: string; bg: string; 
   refresh_creative: { label: "Refresh Creative", color: "text-orange-400", bg: "bg-orange-500/10", icon: RefreshCw },
   mutate_winner: { label: "A/B Test", color: "text-indigo-400", bg: "bg-indigo-500/10", icon: Sparkles },
   create_lookalike: { label: "Lookalike", color: "text-teal-400", bg: "bg-teal-500/10", icon: Target },
+  create_engagement_audience: { label: "Retarget Engagers", color: "text-purple-400", bg: "bg-purple-500/10", icon: Target },
   custom: { label: "Recommendation", color: "text-gray-400", bg: "bg-gray-500/10", icon: Lightbulb },
 };
 
@@ -672,7 +684,7 @@ function StrategyReport({ report }: { report: string }) {
           </div>
           <div>
             <h3 className="text-base font-semibold text-white">AI Strategy Report</h3>
-            <p className="text-xs text-gray-500">Powered by AI &middot; Based on your last 30 days</p>
+            <p className="text-xs text-gray-500">Powered by AI &middot; Based on your all-time</p>
           </div>
         </div>
       </div>
@@ -805,6 +817,7 @@ export function AccountAuditWidget() {
   const [syncing, setSyncing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [toneApplied, setToneApplied] = useState(false);
+  const [statusFilter, setStatusFilter] = useState<"active" | "all">("active");
 
   const fetchAudit = async () => {
     try {
@@ -821,7 +834,7 @@ export function AccountAuditWidget() {
     setSyncing(true);
     setError(null);
     try {
-      const { data } = await api.runAudit();
+      const { data } = await api.runAudit(undefined, statusFilter);
       setAudit(data);
     } catch (e: unknown) {
       const msg =
@@ -836,6 +849,7 @@ export function AccountAuditWidget() {
   useEffect(() => {
     fetchAudit();
   }, []);
+  useAutoRefresh(fetchAudit);
 
   // ── Loading skeleton ──────────────────────────────────────────────────────
   if (loading) {
@@ -876,7 +890,7 @@ export function AccountAuditWidget() {
               <p className="text-sm text-gray-500 leading-relaxed max-w-xl">
                 {audit?.status === "failed"
                   ? `Last audit failed: ${audit.error_message || "Unknown error"}. Click below to try again.`
-                  : "Run an AI-powered audit to analyze your last 30 days of ad performance — identify winning ads, wasted spend, and get strategic recommendations."}
+                  : "Run an AI-powered audit to analyze your all-time of ad performance — identify winning ads, wasted spend, and get strategic recommendations."}
               </p>
             </div>
             <button
@@ -932,20 +946,18 @@ export function AccountAuditWidget() {
   const losers = parseAds(audit.losing_ads);
   const bl = parseBaselines(audit.baselines);
 
-  // Determine if this is a lead-generation account
-  const allAds = [...winners, ...losers];
-  const totalLeads = bl?.total_leads ?? allAds.reduce((s, a) => s + (a.leads || 0), 0);
-  const totalPurchases = bl?.total_purchases ?? allAds.reduce((s, a) => s + (a.purchases || 0), 0);
-  const isLeadAccount = (bl?.dominant_type === "leads") || totalLeads > totalPurchases;
-  const totalResults = isLeadAccount ? totalLeads : totalPurchases;
-
-  // Dynamic threshold labels from baselines
-  const winLabel = bl && bl.win_threshold != null
-    ? (isLeadAccount ? `CPL ≤ $${bl.win_threshold.toFixed(0)}` : `ROAS ≥ ${bl.win_threshold.toFixed(1)}x`)
-    : (isLeadAccount ? "Best CPL" : "Best ROAS");
-  const loseLabel = bl && bl.lose_threshold != null
-    ? (isLeadAccount ? `CPL ≥ $${bl.lose_threshold.toFixed(0)}` : `ROAS ≤ ${bl.lose_threshold.toFixed(1)}x`)
-    : (isLeadAccount ? "Worst CPL" : "Worst ROAS");
+  // Per-ad result type labels
+  const RESULT_META: Record<string, { label: string; resultLabel: string; costLabel: string }> = {
+    purchases: { label: "Purchases", resultLabel: "purchases", costLabel: "CPA" },
+    registrations: { label: "Registrations", resultLabel: "registrations", costLabel: "Cost/Reg" },
+    leads: { label: "Leads", resultLabel: "leads", costLabel: "CPL" },
+    messaging_conversations: { label: "Conversations", resultLabel: "chats", costLabel: "Cost/Chat" },
+    messaging_replies: { label: "Replies", resultLabel: "replies", costLabel: "Cost/Reply" },
+    link_clicks: { label: "Clicks", resultLabel: "clicks", costLabel: "CPC" },
+    landing_page_views: { label: "Page Views", resultLabel: "views", costLabel: "Cost/View" },
+    none: { label: "Results", resultLabel: "results", costLabel: "CPR" },
+  };
+  const getAdMeta = (ad: any) => RESULT_META[ad.result_type] || RESULT_META.none;
 
   return (
     <div className="mb-8 space-y-4 animate-fade-in">
@@ -960,7 +972,7 @@ export function AccountAuditWidget() {
               Account Health Report
             </h2>
             <p className="text-xs text-gray-500">
-              Last 30 days &middot; Updated{" "}
+              {statusFilter === "all" ? "All" : "Active"} campaigns &middot; Updated{" "}
               {new Date(audit.created_at).toLocaleDateString("en-US", {
                 month: "short",
                 day: "numeric",
@@ -969,18 +981,42 @@ export function AccountAuditWidget() {
             </p>
           </div>
         </div>
-        <button
-          onClick={runAudit}
-          disabled={syncing}
-          className="inline-flex items-center gap-2 px-3 py-1.5 glass rounded-lg text-xs text-gray-400 hover:text-white transition-colors disabled:opacity-50"
-        >
-          {syncing ? (
-            <Loader2 className="w-3 h-3 animate-spin" />
-          ) : (
-            <RefreshCw className="w-3 h-3" />
-          )}
-          Re-run Audit
-        </button>
+        <div className="flex items-center gap-2">
+          <div className="flex items-center bg-white/[0.04] rounded-lg p-0.5">
+            <button
+              onClick={() => setStatusFilter("active")}
+              className={`px-2.5 py-1 text-[11px] font-medium rounded-md transition-all ${
+                statusFilter === "active"
+                  ? "bg-emerald-500/20 text-emerald-400"
+                  : "text-gray-500 hover:text-gray-300"
+              }`}
+            >
+              Active
+            </button>
+            <button
+              onClick={() => setStatusFilter("all")}
+              className={`px-2.5 py-1 text-[11px] font-medium rounded-md transition-all ${
+                statusFilter === "all"
+                  ? "bg-emerald-500/20 text-emerald-400"
+                  : "text-gray-500 hover:text-gray-300"
+              }`}
+            >
+              All
+            </button>
+          </div>
+          <button
+            onClick={runAudit}
+            disabled={syncing}
+            className="inline-flex items-center gap-2 px-3 py-1.5 glass rounded-lg text-xs text-gray-400 hover:text-white transition-colors disabled:opacity-50"
+          >
+            {syncing ? (
+              <Loader2 className="w-3 h-3 animate-spin" />
+            ) : (
+              <RefreshCw className="w-3 h-3" />
+            )}
+            Re-run Audit
+          </button>
+        </div>
       </div>
 
       {/* ── Top metric cards ─────────────────────────────────────────────── */}
@@ -991,7 +1027,7 @@ export function AccountAuditWidget() {
             <div className="w-9 h-9 rounded-xl bg-emerald-500/10 text-emerald-400 flex items-center justify-center">
               <DollarSign className="w-[18px] h-[18px]" />
             </div>
-            <span className="text-xs text-gray-600 font-medium">LAST 30 DAYS</span>
+            <span className="text-xs text-gray-600 font-medium">ALL-TIME</span>
           </div>
           <p className="text-sm text-gray-500 mb-0.5">Total Spend</p>
           <p className="text-2xl font-bold text-white tracking-tight">
@@ -1003,50 +1039,42 @@ export function AccountAuditWidget() {
           </p>
         </div>
 
-        {/* Blended ROAS or Avg CPL */}
-        {isLeadAccount ? (
-          <div className="glass rounded-2xl p-5 hover:bg-white/[0.04] transition-all duration-300">
-            <div className="flex items-center justify-between mb-3">
-              <div className="w-9 h-9 rounded-xl bg-violet-500/10 text-violet-400 flex items-center justify-center">
-                <TrendingUp className="w-[18px] h-[18px]" />
-              </div>
+        {/* Total Results / ROAS */}
+        <div className="glass rounded-2xl p-5 hover:bg-white/[0.04] transition-all duration-300">
+          <div className="flex items-center justify-between mb-3">
+            <div className="w-9 h-9 rounded-xl bg-violet-500/10 text-violet-400 flex items-center justify-center">
+              <TrendingUp className="w-[18px] h-[18px]" />
+            </div>
+            {audit.roas && Number(audit.roas) > 0 ? (
+              <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${
+                Number(audit.roas) >= 3 ? "bg-emerald-500/10 text-emerald-400"
+                : Number(audit.roas) >= 1.5 ? "bg-yellow-500/10 text-yellow-400"
+                : "bg-red-500/10 text-red-400"
+              }`}>
+                {Number(audit.roas) >= 3 ? "Healthy" : Number(audit.roas) >= 1.5 ? "Needs Work" : "At Risk"}
+              </span>
+            ) : (
               <span className="text-xs font-semibold px-2 py-0.5 rounded-full bg-blue-500/10 text-blue-400">
-                Lead Gen
+                {RESULT_META[bl?.dominant_type || ""]?.label || bl?.dominant_type || "Mixed"}
               </span>
-            </div>
-            <p className="text-sm text-gray-500 mb-0.5">Total Leads</p>
-            <p className="text-2xl font-bold text-white tracking-tight">
-              {totalResults}
-            </p>
+            )}
           </div>
-        ) : (
-          <div className="glass rounded-2xl p-5 hover:bg-white/[0.04] transition-all duration-300">
-            <div className="flex items-center justify-between mb-3">
-              <div className="w-9 h-9 rounded-xl bg-violet-500/10 text-violet-400 flex items-center justify-center">
-                <TrendingUp className="w-[18px] h-[18px]" />
-              </div>
-              <span
-                className={`text-xs font-semibold px-2 py-0.5 rounded-full ${
-                  audit.roas && audit.roas >= 3
-                    ? "bg-emerald-500/10 text-emerald-400"
-                    : audit.roas && audit.roas >= 1.5
-                    ? "bg-yellow-500/10 text-yellow-400"
-                    : "bg-red-500/10 text-red-400"
-                }`}
-              >
-                {audit.roas && audit.roas >= 3
-                  ? "Healthy"
-                  : audit.roas && audit.roas >= 1.5
-                  ? "Needs Work"
-                  : "At Risk"}
-              </span>
-            </div>
-            <p className="text-sm text-gray-500 mb-0.5">Blended ROAS</p>
-            <p className="text-2xl font-bold text-white tracking-tight">
-              {audit.roas ? `${Number(audit.roas).toFixed(2)}x` : "N/A"}
-            </p>
-          </div>
-        )}
+          {audit.roas && Number(audit.roas) > 0 ? (
+            <>
+              <p className="text-sm text-gray-500 mb-0.5">Blended ROAS</p>
+              <p className="text-2xl font-bold text-white tracking-tight">
+                {Number(audit.roas).toFixed(2)}x
+              </p>
+            </>
+          ) : (
+            <>
+              <p className="text-sm text-gray-500 mb-0.5">Total Results</p>
+              <p className="text-2xl font-bold text-white tracking-tight">
+                {[...winners, ...losers].reduce((s, a) => s + (a.results || 0), 0)}
+              </p>
+            </>
+          )}
+        </div>
       </div>
 
       {/* ── Audience Demographics ──────────────────────────────────────── */}
@@ -1121,115 +1149,135 @@ export function AccountAuditWidget() {
         </div>
       )}
 
-      {/* ── Winning vs Losing Ads ────────────────────────────────────────── */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        {/* Winning Ads */}
-        <div className="glass rounded-2xl p-5">
-          <div className="flex items-center gap-2 mb-4">
-            <Trophy className="w-4 h-4 text-emerald-400" />
-            <h3 className="text-sm font-semibold text-white">
-              Winning Ads
-            </h3>
-            <span className="text-xs text-gray-600 ml-auto">
-              {winLabel}
-            </span>
-          </div>
-          {winners.length === 0 ? (
-            <p className="text-sm text-gray-500 py-4 text-center">
-              No winning ads found in the last 30 days.
-            </p>
-          ) : (
-            <div className="space-y-1">
-              {/* Header row */}
-              <div className="grid grid-cols-[1fr_70px_60px_60px] gap-2 text-[10px] text-gray-600 uppercase tracking-wider pb-2 border-b border-white/5">
-                <span>Ad Name</span>
-                <span className="text-right">Spend</span>
-                <span className="text-right">{isLeadAccount ? "CPL" : "CPA"}</span>
-                <span className="text-right">CTR</span>
-              </div>
-              {winners.slice(0, 5).map((ad, i) => (
-                <div
-                  key={i}
-                  className="grid grid-cols-[1fr_70px_60px_60px] gap-2 py-2 border-b border-white/5 last:border-0 items-center"
-                >
-                  <div className="min-w-0">
-                    <p className="text-sm text-white truncate">{ad.ad_name}</p>
-                    <span className="text-[10px] text-emerald-400 font-medium">
-                      {isLeadAccount
-                        ? `${ad.results || 0} leads`
-                        : ad.roas ? `${ad.roas}x ROAS` : ""}
-                    </span>
-                  </div>
-                  <span className="text-xs text-gray-400 text-right">
-                    ${ad.spend.toFixed(0)}
-                  </span>
-                  <span className="text-xs text-gray-400 text-right">
-                    {isLeadAccount
-                      ? (ad.cost_per_result ? `$${ad.cost_per_result.toFixed(2)}` : "—")
-                      : (ad.cost_per_purchase ? `$${ad.cost_per_purchase.toFixed(2)}` : "—")}
-                  </span>
-                  <span className="text-xs text-gray-400 text-right">
-                    {Number(ad.ctr).toFixed(2)}%
-                  </span>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
+      {/* ── All Ads — Scored & Categorized ──────────────────────────────── */}
+      {(() => {
+        // All evaluated ads are now stored in winning_ads (with score + verdict)
+        // losers is kept for backward compat but we use winners as the master list
+        const allAds = winners.length > losers.length
+          ? [...winners].sort((a: any, b: any) => (b.score || 0) - (a.score || 0))
+          : [...winners, ...losers].sort((a: any, b: any) => (b.score || 0) - (a.score || 0));
+        const scaleAds = allAds.filter((a: any) => a.verdict === "scale");
+        const holdAds = allAds.filter((a: any) => a.verdict === "hold");
+        const underAds = allAds.filter((a: any) => a.verdict === "underperforming" || a.verdict === "kill");
+        const learnAds = allAds.filter((a: any) => a.verdict === "learning");
 
-        {/* Losing Ads */}
-        <div className="glass rounded-2xl p-5">
-          <div className="flex items-center gap-2 mb-4">
-            <ThumbsDown className="w-4 h-4 text-red-400" />
-            <h3 className="text-sm font-semibold text-white">
-              Underperforming Ads
-            </h3>
-            <span className="text-xs text-gray-600 ml-auto">
-              {loseLabel}{isLeadAccount ? " or no leads" : ""}
-            </span>
-          </div>
-          {losers.length === 0 ? (
-            <p className="text-sm text-gray-500 py-4 text-center">
-              No underperforming ads found — great job!
-            </p>
-          ) : (
-            <div className="space-y-1">
-              <div className="grid grid-cols-[1fr_70px_60px_60px] gap-2 text-[10px] text-gray-600 uppercase tracking-wider pb-2 border-b border-white/5">
-                <span>Ad Name</span>
-                <span className="text-right">Spend</span>
-                <span className="text-right">{isLeadAccount ? "CPL" : "CPA"}</span>
-                <span className="text-right">CTR</span>
-              </div>
-              {losers.slice(0, 5).map((ad, i) => (
-                <div
-                  key={i}
-                  className="grid grid-cols-[1fr_70px_60px_60px] gap-2 py-2 border-b border-white/5 last:border-0 items-center"
-                >
-                  <div className="min-w-0">
-                    <p className="text-sm text-white truncate">{ad.ad_name}</p>
-                    <span className="text-[10px] text-red-400 font-medium">
-                      {isLeadAccount
-                        ? (ad.results > 0 ? `$${(ad.cost_per_result || 0).toFixed(0)} CPL` : "0 leads")
-                        : (ad.roas ? `${ad.roas}x ROAS` : "0 purchases")}
+        const VERDICT_STYLES: Record<string, { bg: string; text: string; label: string }> = {
+          scale: { bg: "bg-emerald-500/10", text: "text-emerald-400", label: "Scale" },
+          hold: { bg: "bg-amber-500/10", text: "text-amber-400", label: "Hold" },
+          underperforming: { bg: "bg-red-500/10", text: "text-red-400", label: "Underperforming" },
+          kill: { bg: "bg-red-500/10", text: "text-red-400", label: "Kill" },
+          learning: { bg: "bg-blue-500/10", text: "text-blue-400", label: "Learning" },
+        };
+
+        const renderAdRow = (ad: any, i: number) => {
+          const m = getAdMeta(ad);
+          const vs = VERDICT_STYLES[ad.verdict] || VERDICT_STYLES.hold;
+          return (
+            <div key={i} className="border-b border-white/5 last:border-0">
+              <div className="grid grid-cols-[32px_1fr_65px_70px_55px_55px] gap-2 py-2.5 items-center">
+                {/* Score badge */}
+                <div className={`w-8 h-8 rounded-lg ${vs.bg} flex items-center justify-center`}>
+                  <span className={`text-xs font-bold ${vs.text}`}>{ad.score ?? "—"}</span>
+                </div>
+                {/* Name + result type */}
+                <div className="min-w-0">
+                  <p className="text-sm text-white truncate">{ad.ad_name}</p>
+                  <div className="flex items-center gap-2 text-[10px]">
+                    <span className={`font-medium ${vs.text}`}>
+                      {ad.results || 0} {m.resultLabel}
+                    </span>
+                    {ad.days_running != null && (
+                      <span className="text-gray-600">{ad.days_running}d</span>
+                    )}
+                    <span className={`px-1.5 py-0 rounded-full ${vs.bg} ${vs.text} text-[9px] font-medium`}>
+                      {vs.label}
                     </span>
                   </div>
-                  <span className="text-xs text-gray-400 text-right">
-                    ${ad.spend.toFixed(0)}
-                  </span>
-                  <span className="text-xs text-gray-400 text-right">
-                    {isLeadAccount
-                      ? (ad.cost_per_result ? `$${ad.cost_per_result.toFixed(2)}` : "—")
-                      : (ad.cost_per_purchase ? `$${ad.cost_per_purchase.toFixed(2)}` : "—")}
-                  </span>
-                  <span className="text-xs text-gray-400 text-right">
-                    {Number(ad.ctr).toFixed(2)}%
-                  </span>
                 </div>
-              ))}
+                {/* Spend */}
+                <span className="text-xs text-gray-400 text-right">${ad.spend?.toFixed(0)}</span>
+                {/* Cost per result */}
+                <div className="text-right">
+                  <span className="text-xs text-gray-400">{ad.cost_per_result ? `$${ad.cost_per_result.toFixed(2)}` : "—"}</span>
+                  <span className="text-[9px] text-gray-600 block">{m.costLabel}</span>
+                </div>
+                {/* CTR */}
+                <span className="text-xs text-gray-400 text-right">{Number(ad.ctr || 0).toFixed(2)}%</span>
+                {/* CPC */}
+                <span className="text-xs text-gray-400 text-right">${Number(ad.cpc || 0).toFixed(2)}</span>
+              </div>
+              {ad.diagnosis && ad.verdict !== "scale" && (
+                <div className="flex items-center gap-2 pb-2 pl-10">
+                  <p className="text-[11px] text-amber-400/80 leading-relaxed flex-1">{ad.diagnosis}</p>
+                  <button
+                    onClick={async (e) => {
+                      e.stopPropagation();
+                      const btn = e.currentTarget;
+                      btn.disabled = true;
+                      btn.textContent = "Generating...";
+                      try {
+                        await api.bridgeAuditDiagnosis({
+                          ad_id: ad.ad_id || "",
+                          ad_name: ad.ad_name || "",
+                          adset_id: "",
+                          diagnosis: ad.diagnosis || "",
+                          campaign_id: ad.campaign_id || "",
+                        });
+                        const adIdParam = encodeURIComponent(ad.ad_id || "");
+                        const adNameParam = encodeURIComponent(ad.ad_name || "");
+                        window.location.href = `/dashboard/copilot?filter_ad_id=${adIdParam}&ad_name=${adNameParam}&_t=${Date.now()}`;
+                      } catch {
+                        btn.textContent = "Failed";
+                        setTimeout(() => { btn.textContent = "Fix →"; btn.disabled = false; }, 2000);
+                      }
+                    }}
+                    className="text-[10px] px-2 py-0.5 rounded-full bg-violet-500/10 text-violet-400 hover:bg-violet-500/20 border border-violet-500/20 shrink-0 transition-all disabled:opacity-50"
+                  >
+                    Fix →
+                  </button>
+                </div>
+              )}
             </div>
-          )}
-        </div>
-      </div>
+          );
+        };
+
+        const renderSection = (title: string, icon: any, ads: any[], color: string) => {
+          if (ads.length === 0) return null;
+          const Icon = icon;
+          return (
+            <div className="glass rounded-2xl p-5">
+              <div className="flex items-center gap-2 mb-3">
+                <Icon className={`w-4 h-4 ${color}`} />
+                <h3 className="text-sm font-semibold text-white">{title}</h3>
+                <span className="text-xs text-gray-600 ml-auto">{ads.length} ad{ads.length !== 1 ? "s" : ""}</span>
+              </div>
+              <div className="grid grid-cols-[32px_1fr_65px_70px_55px_55px] gap-2 text-[9px] text-gray-600 uppercase tracking-wider pb-2 border-b border-white/5">
+                <span></span>
+                <span>Ad Name</span>
+                <span className="text-right">Spend</span>
+                <span className="text-right">Cost/Res</span>
+                <span className="text-right">CTR</span>
+                <span className="text-right">CPC</span>
+              </div>
+              {ads.map(renderAdRow)}
+            </div>
+          );
+        };
+
+        return (
+          <div className="space-y-4">
+            {renderSection("Scale — Top Performers", Trophy, scaleAds, "text-emerald-400")}
+            {renderSection("Hold — Average Performers", Activity, holdAds, "text-amber-400")}
+            {renderSection("Underperforming — Needs Action", ThumbsDown, underAds, "text-red-400")}
+            {renderSection("Learning — Still Optimizing", Sparkles, learnAds, "text-blue-400")}
+            {allAds.length === 0 && (
+              <div className="glass rounded-2xl p-5 text-center">
+                <p className="text-sm text-gray-500">No ad data found. Run a new audit.</p>
+              </div>
+            )}
+          </div>
+        );
+      })()}
 
       {/* ── AI Strategy Report ──────────────────────────────────────────── */}
       {audit.ai_strategy_report && audit.ai_strategy_report.trim() ? (

@@ -21,32 +21,37 @@ _settings = get_settings()
 _KEY = _settings.SECRET_KEY.encode()
 
 
-def _sign(user_id: str, nonce: str) -> str:
-    msg = f"{user_id}:{nonce}".encode()
+def _sign(payload: str, nonce: str) -> str:
+    msg = f"{payload}:{nonce}".encode()
     return hmac.new(_KEY, msg, hashlib.sha256).hexdigest()
 
 
-def generate_state(user_id: str) -> str:
-    """Return a signed, URL-safe state token embedding the user_id."""
+def generate_state(user_id: str, workspace_id: str | None = None) -> str:
+    """Return a signed, URL-safe state token embedding user_id and optional workspace_id."""
     nonce = secrets.token_hex(16)
-    sig = _sign(user_id, nonce)
-    raw = f"{user_id}:{nonce}:{sig}"
+    payload = f"{user_id}|{workspace_id or ''}"
+    sig = _sign(payload, nonce)
+    raw = f"{payload}:{nonce}:{sig}"
     return base64.urlsafe_b64encode(raw.encode()).decode()
 
 
-def verify_state(state: str) -> str:
+def verify_state(state: str) -> tuple[str, str | None]:
     """
-    Verify the state token and return the user_id it contains.
+    Verify the state token and return (user_id, workspace_id).
+    workspace_id may be None if not embedded.
     Raises ValueError on any tampering or malformed input.
     """
     try:
         raw = base64.urlsafe_b64decode(state.encode()).decode()
-        user_id, nonce, provided_sig = raw.split(":", 2)
+        payload, nonce, provided_sig = raw.split(":", 2)
     except Exception:
         raise ValueError("Malformed state token")
 
-    expected_sig = _sign(user_id, nonce)
+    expected_sig = _sign(payload, nonce)
     if not hmac.compare_digest(provided_sig, expected_sig):
         raise ValueError("State token signature mismatch — possible CSRF attack")
 
-    return user_id
+    parts = payload.split("|", 1)
+    user_id = parts[0]
+    workspace_id = parts[1] if len(parts) > 1 and parts[1] else None
+    return user_id, workspace_id

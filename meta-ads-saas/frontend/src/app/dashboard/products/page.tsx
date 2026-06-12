@@ -29,7 +29,11 @@ import {
   ClipboardList,
   Phone,
   MessagesSquare,
+  CheckCircle2,
+  AlertCircle,
+  MapPin,
 } from "lucide-react";
+import { CityPicker, type GeoCity } from "@/components/ui/CityPicker";
 
 /* ── Types ─────────────────────────────────────────────────────────────────── */
 
@@ -67,6 +71,7 @@ type Product = {
   product_options: VariationGroup[] | null;
   profit_margin: number | null;
   target_country: string | null;
+  target_cities: GeoCity[] | null;
   pixel_id: string | null;
   variants: { id?: string; variant_name: string; price: string | number; currency: string; sku: string }[];
 };
@@ -83,6 +88,7 @@ type FormData = {
   product_type: string;
   profit_margin: string;
   target_country: string;
+  target_cities: GeoCity[];
   pixel_id: string;
 };
 
@@ -98,26 +104,154 @@ const EMPTY_FORM: FormData = {
   product_type: "physical",
   profit_margin: "",
   target_country: "",
+  target_cities: [] as GeoCity[],
   pixel_id: "",
 };
 
 const TARGET_COUNTRIES = [
   { value: "", label: "Use account default" },
-  { value: "PK", label: "Pakistan" },
-  { value: "US", label: "United States" },
-  { value: "GB", label: "United Kingdom" },
-  { value: "AE", label: "UAE" },
-  { value: "SA", label: "Saudi Arabia" },
-  { value: "IN", label: "India" },
-  { value: "CA", label: "Canada" },
+  { value: "AF", label: "Afghanistan" },
+  { value: "AL", label: "Albania" },
+  { value: "DZ", label: "Algeria" },
+  { value: "AO", label: "Angola" },
+  { value: "AR", label: "Argentina" },
+  { value: "AM", label: "Armenia" },
   { value: "AU", label: "Australia" },
-  { value: "DE", label: "Germany" },
-  { value: "FR", label: "France" },
-  { value: "TR", label: "Turkey" },
-  { value: "MY", label: "Malaysia" },
-  { value: "NG", label: "Nigeria" },
-  { value: "KE", label: "Kenya" },
+  { value: "AT", label: "Austria" },
+  { value: "AZ", label: "Azerbaijan" },
+  { value: "BH", label: "Bahrain" },
   { value: "BD", label: "Bangladesh" },
+  { value: "BY", label: "Belarus" },
+  { value: "BE", label: "Belgium" },
+  { value: "BJ", label: "Benin" },
+  { value: "BO", label: "Bolivia" },
+  { value: "BA", label: "Bosnia & Herzegovina" },
+  { value: "BW", label: "Botswana" },
+  { value: "BR", label: "Brazil" },
+  { value: "BN", label: "Brunei" },
+  { value: "BG", label: "Bulgaria" },
+  { value: "BF", label: "Burkina Faso" },
+  { value: "KH", label: "Cambodia" },
+  { value: "CM", label: "Cameroon" },
+  { value: "CA", label: "Canada" },
+  { value: "CL", label: "Chile" },
+  { value: "CN", label: "China" },
+  { value: "CO", label: "Colombia" },
+  { value: "CD", label: "Congo (DRC)" },
+  { value: "CR", label: "Costa Rica" },
+  { value: "CI", label: "Côte d'Ivoire" },
+  { value: "HR", label: "Croatia" },
+  { value: "CY", label: "Cyprus" },
+  { value: "CZ", label: "Czech Republic" },
+  { value: "DK", label: "Denmark" },
+  { value: "DO", label: "Dominican Republic" },
+  { value: "EC", label: "Ecuador" },
+  { value: "EG", label: "Egypt" },
+  { value: "SV", label: "El Salvador" },
+  { value: "EE", label: "Estonia" },
+  { value: "ET", label: "Ethiopia" },
+  { value: "FI", label: "Finland" },
+  { value: "FR", label: "France" },
+  { value: "GA", label: "Gabon" },
+  { value: "GE", label: "Georgia" },
+  { value: "DE", label: "Germany" },
+  { value: "GH", label: "Ghana" },
+  { value: "GR", label: "Greece" },
+  { value: "GT", label: "Guatemala" },
+  { value: "GN", label: "Guinea" },
+  { value: "HN", label: "Honduras" },
+  { value: "HK", label: "Hong Kong" },
+  { value: "HU", label: "Hungary" },
+  { value: "IS", label: "Iceland" },
+  { value: "IN", label: "India" },
+  { value: "ID", label: "Indonesia" },
+  { value: "IQ", label: "Iraq" },
+  { value: "IE", label: "Ireland" },
+  { value: "IL", label: "Israel" },
+  { value: "IT", label: "Italy" },
+  { value: "JM", label: "Jamaica" },
+  { value: "JP", label: "Japan" },
+  { value: "JO", label: "Jordan" },
+  { value: "KZ", label: "Kazakhstan" },
+  { value: "KE", label: "Kenya" },
+  { value: "KW", label: "Kuwait" },
+  { value: "KG", label: "Kyrgyzstan" },
+  { value: "LA", label: "Laos" },
+  { value: "LV", label: "Latvia" },
+  { value: "LB", label: "Lebanon" },
+  { value: "LY", label: "Libya" },
+  { value: "LT", label: "Lithuania" },
+  { value: "LU", label: "Luxembourg" },
+  { value: "MG", label: "Madagascar" },
+  { value: "MW", label: "Malawi" },
+  { value: "MY", label: "Malaysia" },
+  { value: "MV", label: "Maldives" },
+  { value: "ML", label: "Mali" },
+  { value: "MT", label: "Malta" },
+  { value: "MU", label: "Mauritius" },
+  { value: "MX", label: "Mexico" },
+  { value: "MD", label: "Moldova" },
+  { value: "MN", label: "Mongolia" },
+  { value: "ME", label: "Montenegro" },
+  { value: "MA", label: "Morocco" },
+  { value: "MZ", label: "Mozambique" },
+  { value: "MM", label: "Myanmar" },
+  { value: "NA", label: "Namibia" },
+  { value: "NP", label: "Nepal" },
+  { value: "NL", label: "Netherlands" },
+  { value: "NZ", label: "New Zealand" },
+  { value: "NI", label: "Nicaragua" },
+  { value: "NE", label: "Niger" },
+  { value: "NG", label: "Nigeria" },
+  { value: "MK", label: "North Macedonia" },
+  { value: "NO", label: "Norway" },
+  { value: "OM", label: "Oman" },
+  { value: "PK", label: "Pakistan" },
+  { value: "PS", label: "Palestine" },
+  { value: "PA", label: "Panama" },
+  { value: "PY", label: "Paraguay" },
+  { value: "PE", label: "Peru" },
+  { value: "PH", label: "Philippines" },
+  { value: "PL", label: "Poland" },
+  { value: "PT", label: "Portugal" },
+  { value: "PR", label: "Puerto Rico" },
+  { value: "QA", label: "Qatar" },
+  { value: "RO", label: "Romania" },
+  { value: "RU", label: "Russia" },
+  { value: "RW", label: "Rwanda" },
+  { value: "SA", label: "Saudi Arabia" },
+  { value: "SN", label: "Senegal" },
+  { value: "RS", label: "Serbia" },
+  { value: "SG", label: "Singapore" },
+  { value: "SK", label: "Slovakia" },
+  { value: "SI", label: "Slovenia" },
+  { value: "SO", label: "Somalia" },
+  { value: "ZA", label: "South Africa" },
+  { value: "KR", label: "South Korea" },
+  { value: "ES", label: "Spain" },
+  { value: "LK", label: "Sri Lanka" },
+  { value: "SD", label: "Sudan" },
+  { value: "SE", label: "Sweden" },
+  { value: "CH", label: "Switzerland" },
+  { value: "TW", label: "Taiwan" },
+  { value: "TJ", label: "Tajikistan" },
+  { value: "TZ", label: "Tanzania" },
+  { value: "TH", label: "Thailand" },
+  { value: "TN", label: "Tunisia" },
+  { value: "TR", label: "Turkey" },
+  { value: "TM", label: "Turkmenistan" },
+  { value: "UG", label: "Uganda" },
+  { value: "UA", label: "Ukraine" },
+  { value: "AE", label: "UAE" },
+  { value: "GB", label: "United Kingdom" },
+  { value: "US", label: "United States" },
+  { value: "UY", label: "Uruguay" },
+  { value: "UZ", label: "Uzbekistan" },
+  { value: "VE", label: "Venezuela" },
+  { value: "VN", label: "Vietnam" },
+  { value: "YE", label: "Yemen" },
+  { value: "ZM", label: "Zambia" },
+  { value: "ZW", label: "Zimbabwe" },
 ];
 
 const PRODUCT_TYPES = [
@@ -239,6 +373,14 @@ export default function ProductsPage() {
   const [leadFormCreating, setLeadFormCreating] = useState(false);
   const [leadFormError, setLeadFormError] = useState<string | null>(null);
   const [leadFormPages, setLeadFormPages] = useState<{ page_id: string; page_name: string }[]>([]);
+
+  // Hiring Ads state
+  const [hiringMode, setHiringMode] = useState(false);
+  const [hiringJobTitle, setHiringJobTitle] = useState("");
+  const [hiringCandidateProfile, setHiringCandidateProfile] = useState("");
+  const [hiringSalaryPerks, setHiringSalaryPerks] = useState("");
+  const [hiringRequirements, setHiringRequirements] = useState("");
+  const [hiringResponsibilities, setHiringResponsibilities] = useState("");
   const [leadFormPageId, setLeadFormPageId] = useState("");
 
   // Pixel tracking state
@@ -247,6 +389,7 @@ export default function ProductsPage() {
   const [creatingPixel, setCreatingPixel] = useState(false);
   const [newPixelName, setNewPixelName] = useState("");
   const [pixelBaseCode, setPixelBaseCode] = useState<string | null>(null);
+  const [pixelMessage, setPixelMessage] = useState<{ type: "success" | "error"; text: string } | null>(null);
   const [codeCopied, setCodeCopied] = useState(false);
 
   const matrix = useMemo(
@@ -306,6 +449,7 @@ export default function ProductsPage() {
       product_type: p.product_type || "physical",
       profit_margin: p.profit_margin?.toString() || "",
       target_country: p.target_country || "",
+      target_cities: Array.isArray(p.target_cities) ? p.target_cities as GeoCity[] : [],
       pixel_id: p.pixel_id || "",
     });
     // Restore variation groups from product_options if present
@@ -413,6 +557,7 @@ export default function ProductsPage() {
         product_options: hasVariations ? variationGroups : null,
         profit_margin: form.profit_margin ? parseFloat(form.profit_margin) : null,
         target_country: form.target_country || null,
+        target_cities: form.target_cities.length > 0 ? form.target_cities : null,
         pixel_id: form.pixel_id || null,
       };
 
@@ -514,8 +659,8 @@ export default function ProductsPage() {
       setPixelEventsLoading(true);
       api.getPixelEvents(product.pixel_id)
         .then((res) => {
-          const events = (res as { data: { events: { event: string; count_7d: number }[] } }).data?.events
-            ?? (res as { events: { event: string; count_7d: number }[] }).events
+          const events = (res as unknown as { data: { events: { event: string; count_7d: number }[] } }).data?.events
+            ?? (res as unknown as { events: { event: string; count_7d: number }[] }).events
             ?? [];
           setPixelEvents(events.length > 0 ? events : STANDARD_EVENTS);
           // Auto-select first event
@@ -557,7 +702,14 @@ export default function ProductsPage() {
         : undefined;
       const msgApps = genDestType === "MESSAGING" ? genMsgApps : undefined;
       const callNum = genDestType === "PHONE_CALL" ? genCallPhone.trim() || undefined : undefined;
-      await api.generateDrafts(3, genProductId, abTest, guidance, conversionEvent || undefined, destType, waNum, msgApps, callNum);
+      const hiringData = hiringMode && hiringJobTitle.trim() && hiringCandidateProfile.trim() && hiringSalaryPerks.trim() ? {
+        job_title: hiringJobTitle.trim(),
+        target_candidate_profile: hiringCandidateProfile.trim(),
+        salary_and_perks: hiringSalaryPerks.trim(),
+        requirements: hiringRequirements.trim() || undefined,
+        responsibilities: hiringResponsibilities.trim() || undefined,
+      } : undefined;
+      await api.generateDrafts(3, genProductId, abTest, guidance, conversionEvent || undefined, destType, waNum, msgApps, callNum, hiringData);
       router.push("/dashboard/drafts");
     } catch (err) {
       console.error("Generation failed:", err);
@@ -706,6 +858,22 @@ export default function ProductsPage() {
                   AI will generate culturally relevant ad targeting for this market.
                 </p>
               </div>
+
+              {/* Target Cities */}
+              {form.target_country && (
+                <div>
+                  <label className="flex items-center gap-2 text-sm font-medium text-gray-300 mb-1.5">
+                    <MapPin className="w-3.5 h-3.5 text-emerald-400" /> Target Cities
+                  </label>
+                  <CityPicker
+                    value={form.target_cities}
+                    onChange={(v) => setForm((f) => ({ ...f, target_cities: v }))}
+                    countryCode={form.target_country}
+                    placeholder="Search cities..."
+                    compact
+                  />
+                </div>
+              )}
 
               {/* Price + Currency — hidden when variation groups exist */}
               {!hasVariations && (
@@ -1019,6 +1187,7 @@ export default function ProductsPage() {
                       type="button"
                       onClick={async () => {
                         setCreatingPixel(true);
+                        setPixelMessage(null);
                         try {
                           const { data } = await api.createPixel(newPixelName || `${form.name} Pixel`);
                           const pid = data.pixel_id || data.id;
@@ -1027,7 +1196,16 @@ export default function ProductsPage() {
                           setForm((f) => ({ ...f, pixel_id: pid }));
                           setPixelBaseCode(data.base_code || null);
                           setNewPixelName("");
-                        } catch { /* error handled */ }
+                          if (data.already_existed) {
+                            setPixelMessage({ type: "success", text: "Existing Pixel found & connected successfully!" });
+                          } else {
+                            setPixelMessage({ type: "success", text: "New Pixel created & connected!" });
+                          }
+                          setTimeout(() => setPixelMessage(null), 5000);
+                        } catch {
+                          setPixelMessage({ type: "error", text: "Failed to create pixel. Check your Meta permissions." });
+                          setTimeout(() => setPixelMessage(null), 5000);
+                        }
                         finally { setCreatingPixel(false); }
                       }}
                       disabled={creatingPixel}
@@ -1038,35 +1216,59 @@ export default function ProductsPage() {
                     </button>
                   </div>
 
-                  {/* Base code snippet */}
-                  {pixelBaseCode && (
-                    <div className="rounded-lg bg-[#0d1117] border border-white/[0.08] overflow-hidden">
-                      <div className="flex items-center justify-between px-3 py-2 border-b border-white/[0.06]">
-                        <p className="text-[11px] font-medium text-emerald-400">Install this on your landing page</p>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            navigator.clipboard.writeText(pixelBaseCode);
-                            setCodeCopied(true);
-                            setTimeout(() => setCodeCopied(false), 2000);
-                          }}
-                          className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-medium bg-white/[0.06] text-gray-400 hover:text-white transition-all"
-                        >
-                          {codeCopied ? <Check className="w-2.5 h-2.5 text-emerald-400" /> : <Copy className="w-2.5 h-2.5" />}
-                          {codeCopied ? "Copied!" : "Copy"}
-                        </button>
-                      </div>
-                      <pre className="px-3 py-2 text-[10px] text-gray-500 leading-relaxed overflow-x-auto max-h-32 overflow-y-auto">
-                        {pixelBaseCode}
-                      </pre>
-                    </div>
-                  )}
-
-                  {form.pixel_id && !pixelBaseCode && (
-                    <p className="text-[11px] text-emerald-400/70">
-                      Pixel {form.pixel_id} will track conversions for this product's URL.
+                  {/* Pixel creation feedback */}
+                  {pixelMessage && (
+                    <p className={`text-xs font-medium px-3 py-2 rounded-lg ${pixelMessage.type === "success" ? "bg-emerald-500/10 text-emerald-400 border border-emerald-500/20" : "bg-red-500/10 text-red-400 border border-red-500/20"}`}>
+                      {pixelMessage.text}
                     </p>
                   )}
+
+                  {/* Tracking Codes Section — base code + all event snippets */}
+                  {form.pixel_id && (() => {
+                    const _pixelId = form.pixel_id;
+                    const _baseCode = `<!-- Meta Pixel Code -->\n<script>\n!function(f,b,e,v,n,t,s)\n{f.fbq||(n=f.fbq=function(){n.callMethod?\nn.callMethod.apply(n,arguments):n.queue.push(arguments)},\nf._fbq||(f._fbq=n),n.push=n,n.loaded=!0,n.version='2.0',\nn.queue=[],t=b.createElement(e),t.async=!0,\nt.src=v,s=b.getElementsByTagName(e)[0],\ns.parentNode.insertBefore(t,s))}(window, document,'script',\n'https://connect.facebook.net/en_US/fbevents.js');\nfbq('init', '${_pixelId}');\nfbq('track', 'PageView');\n</script>\n<noscript><img height="1" width="1" style="display:none"\nsrc="https://www.facebook.com/tr?id=${_pixelId}&ev=PageView&noscript=1"\n/></noscript>\n<!-- End Meta Pixel Code -->`;
+                    const _events = [
+                      { key: "PURCHASE", label: "Purchase", code: "fbq('track', 'Purchase', {value: 0.00, currency: 'USD'});", page: "order confirmation / thank-you page" },
+                      { key: "LEAD", label: "Lead", code: "fbq('track', 'Lead');", page: "form submission success page" },
+                      { key: "COMPLETE_REGISTRATION", label: "Complete Registration", code: "fbq('track', 'CompleteRegistration');", page: "registration success / welcome page" },
+                      { key: "ADD_TO_CART", label: "Add to Cart", code: "fbq('track', 'AddToCart');", page: "add-to-cart button click handler" },
+                      { key: "INITIATE_CHECKOUT", label: "Initiate Checkout", code: "fbq('track', 'InitiateCheckout');", page: "checkout page load" },
+                      { key: "CONTACT", label: "Contact", code: "fbq('track', 'Contact');", page: "contact form success page" },
+                    ];
+                    return (
+                      <div className="rounded-lg border border-white/[0.06] overflow-hidden">
+                        {/* Base Pixel Code */}
+                        <div className="bg-[#0d1117] border-b border-white/[0.06]">
+                          <div className="flex items-center justify-between px-3 py-2 border-b border-white/[0.06]">
+                            <p className="text-[10px] font-medium text-blue-400">Base Pixel Code — install on ALL pages</p>
+                            <button type="button" onClick={() => { navigator.clipboard.writeText(_baseCode); setCodeCopied(true); setTimeout(() => setCodeCopied(false), 2000); }}
+                              className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-medium bg-white/[0.06] text-gray-400 hover:text-white transition-all">
+                              {codeCopied ? <Check className="w-2.5 h-2.5 text-emerald-400" /> : <Copy className="w-2.5 h-2.5" />}
+                              {codeCopied ? "Copied!" : "Copy"}
+                            </button>
+                          </div>
+                          <pre className="px-3 py-2 text-[9px] text-gray-500 leading-relaxed overflow-x-auto max-h-28 overflow-y-auto">{_baseCode}</pre>
+                        </div>
+                        {/* Event Snippets */}
+                        <div className="px-3 py-2.5 space-y-1.5">
+                          <p className="text-[10px] text-gray-500 mb-1">Add these on pages where each action happens:</p>
+                          {_events.map((ev) => (
+                            <div key={ev.key} className="flex items-center gap-2 px-2.5 py-1.5 rounded bg-white/[0.02] border border-white/[0.04]">
+                              <div className="flex-1 min-w-0">
+                                <p className="text-[10px] font-medium text-amber-300/90">{ev.label}</p>
+                                <code className="text-[9px] font-mono text-gray-400 block truncate">{ev.code}</code>
+                                <p className="text-[9px] text-gray-600">Install on: {ev.page}</p>
+                              </div>
+                              <button type="button" onClick={() => navigator.clipboard.writeText(ev.code)}
+                                className="shrink-0 flex items-center gap-1 text-[10px] text-gray-500 hover:text-white px-1.5 py-0.5 rounded bg-white/[0.04]">
+                                <Copy className="w-2.5 h-2.5" />
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    );
+                  })()}
                 </div>
               )}
 
@@ -1239,9 +1441,15 @@ export default function ProductsPage() {
                   </div>
                 )}
                 {p.target_country && (
-                  <div className="flex items-center gap-1.5 text-xs text-blue-400/70 mb-3">
+                  <div className="flex items-center gap-1.5 text-xs text-blue-400/70 mb-3 flex-wrap">
                     <Globe className="w-3 h-3" />
                     {TARGET_COUNTRIES.find((c) => c.value === p.target_country)?.label || p.target_country}
+                    {p.target_cities && p.target_cities.length > 0 && (
+                      <span className="flex items-center gap-1 text-emerald-400/70">
+                        <MapPin className="w-2.5 h-2.5" />
+                        {p.target_cities.map((c) => c.name).join(", ")}
+                      </span>
+                    )}
                   </div>
                 )}
                 {p.tags && p.tags.length > 0 && (
@@ -1264,6 +1472,21 @@ export default function ProductsPage() {
                     {p.variants.length} variant{p.variants.length !== 1 ? "s" : ""}
                   </div>
                 )}
+
+                {/* Pixel status */}
+                <div className="flex items-center gap-1.5 text-xs mb-3">
+                  {p.pixel_id ? (
+                    <span className="inline-flex items-center gap-1 text-emerald-400/70">
+                      <CheckCircle2 className="w-3 h-3" />
+                      Pixel attached
+                    </span>
+                  ) : (
+                    <button onClick={() => openEdit(p)} className="inline-flex items-center gap-1 text-amber-400/70 hover:text-amber-300 transition-colors">
+                      <AlertCircle className="w-3 h-3" />
+                      No pixel — attach one
+                    </button>
+                  )}
+                </div>
 
                 {/* Actions */}
                 <div className="flex items-center gap-2">
@@ -1345,6 +1568,62 @@ export default function ProductsPage() {
                   Generate A/B test variants
                 </span>
               </label>
+
+              {/* Hiring Ad Toggle */}
+              <label className="flex items-center gap-2.5 cursor-pointer group">
+                <input
+                  type="checkbox"
+                  checked={hiringMode}
+                  onChange={(e) => setHiringMode(e.target.checked)}
+                  className="w-4 h-4 rounded border-white/[0.15] bg-white/[0.04] text-emerald-500 focus:ring-emerald-500/30"
+                />
+                <span className="text-sm text-gray-400 group-hover:text-gray-300 transition-colors">
+                  Hiring Ad (1-Click Recruitment)
+                </span>
+              </label>
+
+              {/* Hiring Form Fields */}
+              {hiringMode && (
+                <div className="bg-emerald-500/[0.04] border border-emerald-500/10 rounded-xl px-4 py-4 space-y-3">
+                  <p className="text-[10px] font-semibold uppercase tracking-wider text-emerald-400 flex items-center gap-1.5">
+                    <Sparkles className="w-3 h-3" /> Employment Ad (HEC-Compliant)
+                  </p>
+                  <p className="text-[10px] text-gray-500">Meta restricts age/gender targeting for jobs. The AI will use Creative Filtering — your ad hook acts as the targeting mechanism.</p>
+                  <div>
+                    <label className="text-xs text-gray-500 mb-1 block">Job Title *</label>
+                    <input type="text" value={hiringJobTitle} onChange={(e) => setHiringJobTitle(e.target.value)}
+                      placeholder="e.g. Junior Graphic Designer"
+                      className="w-full px-3 py-2 rounded-xl bg-white/[0.04] border border-white/[0.08] text-white text-sm placeholder-gray-600 focus:outline-none focus:border-emerald-500/40 transition-all" />
+                  </div>
+                  <div>
+                    <label className="text-xs text-gray-500 mb-1 block">Target Candidate Profile *</label>
+                    <input type="text" value={hiringCandidateProfile} onChange={(e) => setHiringCandidateProfile(e.target.value)}
+                      placeholder="e.g. O/A level grads, fluent English, confident"
+                      className="w-full px-3 py-2 rounded-xl bg-white/[0.04] border border-white/[0.08] text-white text-sm placeholder-gray-600 focus:outline-none focus:border-emerald-500/40 transition-all" />
+                    <p className="text-[10px] text-gray-600 mt-0.5">This becomes the ad hook — the creative filter that targets the right people.</p>
+                  </div>
+                  <div>
+                    <label className="text-xs text-gray-500 mb-1 block">Salary & Perks *</label>
+                    <input type="text" value={hiringSalaryPerks} onChange={(e) => setHiringSalaryPerks(e.target.value)}
+                      placeholder="e.g. 50k basic + medical + transport"
+                      className="w-full px-3 py-2 rounded-xl bg-white/[0.04] border border-white/[0.08] text-white text-sm placeholder-gray-600 focus:outline-none focus:border-emerald-500/40 transition-all" />
+                  </div>
+                  <div>
+                    <label className="text-xs text-gray-500 mb-1 block">Requirements (optional)</label>
+                    <textarea value={hiringRequirements} onChange={(e) => setHiringRequirements(e.target.value)}
+                      placeholder="e.g. 1 year experience with Figma, portfolio required..."
+                      rows={2}
+                      className="w-full px-3 py-2 rounded-xl bg-white/[0.04] border border-white/[0.08] text-white text-sm placeholder-gray-600 focus:outline-none focus:border-emerald-500/40 transition-all resize-none" />
+                  </div>
+                  <div>
+                    <label className="text-xs text-gray-500 mb-1 block">Responsibilities (optional)</label>
+                    <textarea value={hiringResponsibilities} onChange={(e) => setHiringResponsibilities(e.target.value)}
+                      placeholder="e.g. Create social media graphics, design marketing materials..."
+                      rows={2}
+                      className="w-full px-3 py-2 rounded-xl bg-white/[0.04] border border-white/[0.08] text-white text-sm placeholder-gray-600 focus:outline-none focus:border-emerald-500/40 transition-all resize-none" />
+                  </div>
+                </div>
+              )}
 
               {/* Destination toggle */}
               <div>
@@ -1514,18 +1793,50 @@ export default function ProductsPage() {
                         Loading pixel events...
                       </div>
                     ) : (
-                      <select
-                        value={conversionEvent}
-                        onChange={(e) => setConversionEvent(e.target.value)}
-                        className="w-full px-4 py-2.5 rounded-xl bg-white/[0.04] border border-white/[0.08] text-white text-sm focus:outline-none focus:border-violet-500/40 transition-all"
-                      >
-                        <option value="">Select conversion goal</option>
-                        {pixelEvents.map((ev) => (
-                          <option key={ev.event} value={ev.event}>
-                            {ev.event.replace(/_/g, " ")}{ev.count_7d > 0 ? ` (${ev.count_7d} in 7d)` : ""}
-                          </option>
-                        ))}
-                      </select>
+                      (() => {
+                        const STANDARD_EVENTS: { value: string; label: string }[] = [
+                          { value: "PURCHASE", label: "Purchase" },
+                          { value: "LEAD", label: "Lead" },
+                          { value: "COMPLETE_REGISTRATION", label: "Registration" },
+                          { value: "ADD_TO_CART", label: "Add to Cart" },
+                          { value: "INITIATE_CHECKOUT", label: "Checkout" },
+                          { value: "CONTACT", label: "Contact" },
+                        ];
+                        const countMap: Record<string, number> = {};
+                        pixelEvents.forEach((ev) => { countMap[ev.event] = ev.count_7d; });
+                        return (
+                          <div className="grid grid-cols-2 gap-2">
+                            {STANDARD_EVENTS.map((ev) => {
+                              const selected = conversionEvent === ev.value;
+                              const count = countMap[ev.value];
+                              return (
+                                <button
+                                  key={ev.value}
+                                  type="button"
+                                  onClick={() => setConversionEvent(ev.value)}
+                                  className={`flex items-center gap-2.5 px-3 py-2.5 rounded-xl border text-left transition-all ${
+                                    selected
+                                      ? "bg-violet-500/10 border-violet-500/40 text-white"
+                                      : "bg-white/[0.03] border-white/[0.08] text-gray-400 hover:bg-white/[0.06] hover:border-white/[0.14] hover:text-gray-200"
+                                  }`}
+                                >
+                                  <span className={`flex-shrink-0 w-3.5 h-3.5 rounded-full border flex items-center justify-center transition-all ${
+                                    selected ? "border-violet-400 bg-violet-500" : "border-gray-600"
+                                  }`}>
+                                    {selected && <span className="w-1.5 h-1.5 rounded-full bg-white" />}
+                                  </span>
+                                  <span className="flex-1 min-w-0">
+                                    <span className="block text-xs font-medium leading-tight">{ev.label}</span>
+                                    {count > 0 && (
+                                      <span className="block text-[10px] text-violet-400/80 leading-tight mt-0.5">{count} in 7d</span>
+                                    )}
+                                  </span>
+                                </button>
+                              );
+                            })}
+                          </div>
+                        );
+                      })()
                     )}
                     <p className="text-[11px] text-gray-600 mt-1">
                       Events actively tracked by your pixel. Used to optimize ad delivery.
@@ -1544,10 +1855,11 @@ export default function ProductsPage() {
               </button>
               <button
                 onClick={handleGenerate}
-                className="flex items-center gap-2 px-5 py-2 rounded-xl text-sm font-semibold bg-gradient-to-r from-blue-600 to-violet-600 hover:from-blue-500 hover:to-violet-500 text-white transition-all"
+                disabled={hiringMode && (!hiringJobTitle.trim() || !hiringCandidateProfile.trim() || !hiringSalaryPerks.trim())}
+                className="flex items-center gap-2 px-5 py-2 rounded-xl text-sm font-semibold bg-gradient-to-r from-blue-600 to-violet-600 hover:from-blue-500 hover:to-violet-500 text-white transition-all disabled:opacity-40 disabled:cursor-not-allowed"
               >
                 <Rocket className="w-3.5 h-3.5" />
-                Generate
+                {hiringMode ? "Generate 3 Hiring Ads" : "Generate"}
               </button>
             </div>
           </div>

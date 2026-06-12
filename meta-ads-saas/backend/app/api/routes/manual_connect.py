@@ -12,7 +12,7 @@ import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
-from ...api.deps import get_current_user_id
+from ...api.deps import get_current_user_id, get_workspace_id
 from ...core.config import get_settings
 from ...services.meta_oauth import fetch_ad_accounts, upsert_ad_accounts
 from ...services.account_auditor import run_audit
@@ -35,6 +35,7 @@ async def manual_connect(
     body: ManualConnectRequest,
     background_tasks: BackgroundTasks,
     user_id: str = Depends(get_current_user_id),
+    workspace_id: str = Depends(get_workspace_id),
 ):
     """
     Validate a manually-provided Meta access token, then save the
@@ -83,9 +84,23 @@ async def manual_connect(
         long_token=body.access_token,
         expires_at=expires_at,
         ad_accounts=matched,
+        workspace_id=workspace_id,
     )
 
-    # 5. Background audit
+    # 5. Sync Meta asset IDs to workspace
+    if saved:
+        from ...db.supabase_client import get_supabase
+        try:
+            first = saved[0]
+            ws_update = {
+                "meta_ad_account_id": first.get("meta_account_id"),
+                "meta_access_token": body.access_token,
+            }
+            get_supabase().table("workspaces").update(ws_update).eq("id", workspace_id).execute()
+        except Exception as e:
+            logger.warning("Failed to sync Meta creds to workspace: %s", e)
+
+    # 6. Background audit
     background_tasks.add_task(_run_audit_safe, user_id)
 
     return {

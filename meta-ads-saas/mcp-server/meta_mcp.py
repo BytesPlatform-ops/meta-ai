@@ -67,7 +67,9 @@ def _parse_meta_error(err: dict) -> str:
         hint = " Hint: Too many API calls. Back off and retry."
 
     sub = f" (subcode {subcode})" if subcode else ""
-    return f"Meta API Error {code}{sub} ({etype}): {message}{hint}"
+    user_msg = err.get("error_user_msg", "")
+    user_detail = f" Detail: {user_msg}" if user_msg else ""
+    return f"Meta API Error {code}{sub} ({etype}): {message}{user_detail}{hint}"
 
 
 def _get(access_token: str, path: str, params: dict | None = None) -> dict:
@@ -334,30 +336,9 @@ def get_ad_pixel_details(user_access_token: str, ad_id: str) -> str:
 
 
 @mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True})
-def create_pixel(
-    access_token: str,
-    ad_account_id: str,
-    pixel_name: str = "AI Pixel",
-) -> str:
-    """
-    Create a new Meta Pixel on the ad account.
-
-    Args:
-        access_token: A valid access token with ads_management permission.
-        ad_account_id: The ad account ID (numeric, without act_ prefix).
-        pixel_name: Name for the new pixel (default: AI Pixel).
-    """
-    act_id = f"act_{ad_account_id}"
-    try:
-        result = _post(access_token, f"{act_id}/adspixels", {"name": pixel_name})
-    except ValueError as e:
-        return json.dumps({"error": str(e)})
-
-    pixel_id = result.get("id")
-    if not pixel_id:
-        return json.dumps({"error": f"Pixel creation failed. Response: {json.dumps(result)}"})
-
-    base_code = (
+def _build_pixel_base_code(pixel_id: str) -> str:
+    """Generate the standard Meta Pixel base code snippet."""
+    return (
         "<!-- Meta Pixel Code -->\n"
         "<script>\n"
         "!function(f,b,e,v,n,t,s)\n"
@@ -377,10 +358,78 @@ def create_pixel(
         "<!-- End Meta Pixel Code -->"
     )
 
+
+def create_pixel(
+    access_token: str,
+    ad_account_id: str,
+    pixel_name: str = "AI Pixel",
+) -> str:
+    """
+    Create a new Meta Pixel and assign it to the ad account.
+
+    Strategy: Create at Business Manager level (supports multiple pixels),
+    then share to the ad account. Falls back to ad-account-level creation
+    for personal accounts without a BM.
+
+    Args:
+        access_token: A valid access token with ads_management permission.
+        ad_account_id: The ad account ID (numeric, without act_ prefix).
+        pixel_name: Name for the new pixel (default: AI Pixel).
+    """
+    act_id = f"act_{ad_account_id}"
+
+    # Step 1: Try to get the parent Business Manager ID
+    business_id = None
+    try:
+        biz_data = _get(access_token, act_id, {"fields": "business"})
+        business_id = biz_data.get("business", {}).get("id")
+    except ValueError:
+        pass  # No BM attached — will use ad-account-level fallback
+
+    # Step 2: Create pixel at BM level (supports multiple pixels)
+    if business_id:
+        try:
+            result = _post(access_token, f"{business_id}/adspixels", {"name": pixel_name})
+            pixel_id = result.get("id")
+            if not pixel_id:
+                return json.dumps({"error": f"BM pixel creation failed. Response: {json.dumps(result)}"})
+
+            # Step 3: Share the pixel with the ad account
+            # shared_accounts expects numeric account ID, not act_ prefixed
+            try:
+                _post(access_token, f"{pixel_id}/shared_accounts", {
+                    "account_id": ad_account_id,
+                    "business": business_id,
+                })
+            except ValueError as share_err:
+                # Non-fatal: pixel created but sharing failed — user can still use it
+                print(f"[PIXEL] Warning: pixel {pixel_id} created but sharing to {act_id} failed: {share_err}", flush=True)
+
+            return json.dumps({
+                "pixel_id": pixel_id,
+                "name": pixel_name,
+                "base_code": _build_pixel_base_code(pixel_id),
+                "created_via": "business_manager",
+            })
+        except ValueError as e:
+            # BM creation failed — fall through to ad-account-level
+            print(f"[PIXEL] BM-level creation failed, falling back to ad-account: {e}", flush=True)
+
+    # Fallback: Create at ad-account level (1 pixel limit)
+    try:
+        result = _post(access_token, f"{act_id}/adspixels", {"name": pixel_name})
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+
+    pixel_id = result.get("id")
+    if not pixel_id:
+        return json.dumps({"error": f"Pixel creation failed. Response: {json.dumps(result)}"})
+
     return json.dumps({
         "pixel_id": pixel_id,
         "name": pixel_name,
-        "base_code": base_code,
+        "base_code": _build_pixel_base_code(pixel_id),
+        "created_via": "ad_account",
     })
 
 

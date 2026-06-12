@@ -3,12 +3,17 @@
 import { useEffect, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import { api } from "@/lib/api";
+import { useWorkspace } from "@/contexts/WorkspaceContext";
 import { ConnectMetaButton } from "@/components/ui/ConnectMetaButton";
 import { AdAccountCard } from "@/components/ui/AdAccountCard";
 import { SmartTrackingCard } from "@/components/ui/SmartTrackingCard";
+import { AccountPickerModal } from "@/components/ui/AccountPickerModal";
+import { PagePickerModal } from "@/components/ui/PagePickerModal";
+import { CountryPicker } from "@/components/ui/CountryPicker";
+import { CityPicker, type GeoCity } from "@/components/ui/CityPicker";
 import {
   CheckCircle2, AlertTriangle, X, Link2, Shield, Briefcase, Loader2,
-  Store, FileText, Users, Globe, Calendar, CalendarDays, Sun, Hand, Phone,
+  Store, FileText, Users, Globe, Calendar, CalendarDays, Sun, Hand, Phone, MapPin,
   Smile, GraduationCap, Megaphone, PiggyBank, TrendingUp, Rocket,
   SlidersHorizontal, Settings2, ChevronDown, ChevronUp,
   Instagram, Facebook, RefreshCw, Monitor, Key,
@@ -68,12 +73,14 @@ type SocialPage = {
 
 export default function SettingsPage() {
   const searchParams = useSearchParams();
+  const { activeWorkspace } = useWorkspace();
   const [accounts, setAccounts] = useState<AdAccount[]>([]);
   const [loading, setLoading] = useState(true);
   const [banner, setBanner] = useState<{ type: "success" | "error"; text: string } | null>(null);
 
-  // Strategy preferences
-  const [strategyOpen, setStrategyOpen] = useState(false);
+  // Strategy preferences — auto-expand during onboarding
+  const isOnboarding = searchParams.get("onboarding") === "true";
+  const [strategyOpen, setStrategyOpen] = useState(isOnboarding);
   const [prefsLoading, setPrefsLoading] = useState(true);
   const [prefsSaving, setPrefsSaving] = useState(false);
   const [prefs, setPrefs] = useState({
@@ -91,13 +98,22 @@ export default function SettingsPage() {
     whatsapp_number: "",
     ad_placements: "BOTH",
     target_country: "PK",
+    target_cities: [] as GeoCity[],
   });
   const [socialPages, setSocialPages] = useState<SocialPage[]>([]);
   const [socialLoading, setSocialLoading] = useState(false);
+  const [waStatus, setWaStatus] = useState<{ connected: boolean; whatsapp_number?: string | null; reason?: string | null; signals?: Record<string, unknown> } | null>(null);
+  const [waStatusLoading, setWaStatusLoading] = useState(false);
+  const [waSignalsOpen, setWaSignalsOpen] = useState(false);
   const [websiteScrapedAt, setWebsiteScrapedAt] = useState<string | null>(null);
   const [websiteIntel, setWebsiteIntel] = useState<Record<string, unknown> | null>(null);
   const [scraping, setScraping] = useState(false);
   const [extraUrls, setExtraUrls] = useState("");
+
+  // Account picker modal
+  const [pickerOpen, setPickerOpen] = useState(false);
+  // Page picker modal
+  const [pagePickerOpen, setPagePickerOpen] = useState(false);
 
   // Manual connect state
   const [manualOpen, setManualOpen] = useState(false);
@@ -129,7 +145,12 @@ export default function SettingsPage() {
     const connected = searchParams.get("connected");
     const metaError = searchParams.get("meta_error");
     if (connected === "true") {
-      setBanner({ type: "success", text: "Meta Ad Account connected successfully!" });
+      setBanner({ type: "success", text: "Meta connected! Choose which ad accounts to link." });
+      if (searchParams.get("choose_accounts") === "true") {
+        setPickerOpen(true);
+        // Remove query params so modal doesn't reopen on refresh
+        window.history.replaceState({}, "", "/dashboard/settings");
+      }
     } else if (metaError) {
       const messages: Record<string, string> = {
         missing_params: "OAuth redirect was missing required parameters.",
@@ -165,7 +186,28 @@ export default function SettingsPage() {
     }
   }, [accounts]);
 
-  // Load existing preferences
+  // Auto-check WhatsApp connection once a Page is linked
+  useEffect(() => {
+    if (!activeWorkspace?.meta_page_id) {
+      setWaStatus(null);
+      return;
+    }
+    setWaStatusLoading(true);
+    api.checkWhatsAppStatus()
+      .then(({ data }) => setWaStatus(data))
+      .catch((err) => {
+        const detail = err?.response?.data?.detail;
+        const msg = typeof detail === "string"
+          ? detail
+          : err?.response?.status === 404
+            ? "Status endpoint missing — restart backend container to load the new code."
+            : err?.message || "Could not reach status endpoint";
+        setWaStatus({ connected: false, reason: msg });
+      })
+      .finally(() => setWaStatusLoading(false));
+  }, [activeWorkspace?.meta_page_id]);
+
+  // Load existing preferences (fall back to workspace fields for new workspaces)
   useEffect(() => {
     api.getPreferences().then(({ data }) => {
       if (data) {
@@ -184,12 +226,22 @@ export default function SettingsPage() {
           whatsapp_number: data.whatsapp_number || "",
           ad_placements: data.ad_placements || "BOTH",
           target_country: data.target_country || "PK",
+          target_cities: Array.isArray(data.target_cities) ? data.target_cities as GeoCity[] : [],
         });
         if (data.website_scraped_at) setWebsiteScrapedAt(data.website_scraped_at);
         if (data.website_intel) setWebsiteIntel(data.website_intel);
+      } else if (activeWorkspace) {
+        // No preferences row yet — pre-fill from workspace fields
+        setPrefs((p) => ({
+          ...p,
+          business_name: activeWorkspace.business_name || "",
+          website_url: activeWorkspace.website_url || "",
+          target_country: activeWorkspace.target_country || "PK",
+          industry_niche: activeWorkspace.industry_niche || "",
+        }));
       }
     }).catch(() => {}).finally(() => setPrefsLoading(false));
-  }, []);
+  }, [activeWorkspace]);
 
   const savePrefs = async () => {
     console.log("[SAVE] savePrefs called, prefs:", JSON.stringify(prefs));
@@ -218,14 +270,45 @@ export default function SettingsPage() {
     { name: "ads_read", desc: "Read ad performance data" },
     { name: "business_management", desc: "Access business accounts" },
     { name: "pages_read_engagement", desc: "Read page engagement" },
+    { name: "pages_manage_posts", desc: "Publish posts on your Page" },
+    { name: "pages_messaging", desc: "Send messages via Messenger" },
   ];
 
   return (
     <div className="p-8 w-full animate-fade-in">
+      {/* Onboarding banner for new workspace setup */}
+      {searchParams.get("onboarding") === "true" && (
+        <div className="mb-6 px-5 py-4 rounded-2xl bg-gradient-to-r from-emerald-500/[0.08] to-blue-500/[0.08] border border-emerald-500/20">
+          <div className="flex items-center gap-3 mb-2">
+            <div className="w-8 h-8 rounded-xl bg-emerald-500/20 flex items-center justify-center">
+              <Briefcase className="w-4 h-4 text-emerald-400" />
+            </div>
+            <h2 className="text-sm font-semibold text-white">Workspace Setup</h2>
+          </div>
+          <div className="flex items-center gap-6 text-xs text-gray-400">
+            <span className={accounts.length > 0 ? "text-emerald-400" : "text-blue-400 font-medium"}>
+              {accounts.length > 0 ? "1. Ad Account Connected" : "1. Connect your Facebook Ad Account"}
+            </span>
+            <span className="text-gray-600">&rarr;</span>
+            <span className={activeWorkspace?.meta_page_id ? "text-emerald-400" : "text-gray-500"}>
+              2. Select Facebook Page
+            </span>
+            <span className="text-gray-600">&rarr;</span>
+            <span className="text-gray-500">3. Fill Business Details</span>
+          </div>
+        </div>
+      )}
+
       {/* Page header */}
       <div className="mb-8">
-        <h1 className="text-2xl font-bold text-white mb-1">Settings</h1>
-        <p className="text-sm text-gray-500">Manage your integrations and ad account connections.</p>
+        <h1 className="text-2xl font-bold text-white mb-1">
+          {searchParams.get("onboarding") === "true" ? "Setup Your Workspace" : "Settings"}
+        </h1>
+        <p className="text-sm text-gray-500">
+          {searchParams.get("onboarding") === "true"
+            ? "Connect your Meta account, pick your page, and fill in your business details."
+            : "Manage your integrations and ad account connections."}
+        </p>
       </div>
 
       {/* Banner */}
@@ -300,7 +383,7 @@ export default function SettingsPage() {
           {manualOpen && (
             <div className="px-6 pb-5 space-y-3 animate-fade-in">
               <p className="text-[11px] text-gray-600 leading-relaxed">
-                Paste a Meta User Access Token and Ad Account ID. The token must have <code className="text-gray-400">ads_management</code> and <code className="text-gray-400">ads_read</code> permissions.
+                Paste a Meta User Access Token and Ad Account ID. The token must have <code className="text-gray-400">ads_management</code>, <code className="text-gray-400">ads_read</code>, <code className="text-gray-400">pages_manage_posts</code>, and <code className="text-gray-400">pages_messaging</code> permissions.
               </p>
               <div>
                 <label className="text-xs text-gray-500 mb-1 block">Meta Access Token</label>
@@ -354,55 +437,157 @@ export default function SettingsPage() {
               </div>
               <div>
                 <p className="text-sm font-semibold text-white">Social Profiles</p>
-                <p className="text-xs text-gray-500">Facebook Page &amp; linked Instagram account.</p>
+                <p className="text-xs text-gray-500">Facebook Page &amp; linked Instagram account for this workspace.</p>
               </div>
             </div>
             <button
-              onClick={async () => {
-                setSocialLoading(true);
-                try {
-                  const { data } = await api.fetchSocialIdentities();
-                  setSocialPages(data.pages || []);
-                } catch { setSocialPages([]); }
-                finally { setSocialLoading(false); }
-              }}
+              onClick={() => setPagePickerOpen(true)}
               className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-white/[0.04] border border-white/[0.08] text-gray-400 hover:text-white transition-all"
             >
-              <RefreshCw className={`w-3.5 h-3.5 ${socialLoading ? "animate-spin" : ""}`} />
-              {socialLoading ? "Fetching…" : "Refresh"}
+              <RefreshCw className="w-3.5 h-3.5" />
+              {activeWorkspace?.meta_page_id ? "Change Page" : "Choose Page"}
             </button>
           </div>
 
-          {socialPages.length > 0 ? (
-            <div className="space-y-3">
-              {socialPages.map((p) => (
-                <div key={p.page_id} className="flex items-center gap-4 p-3 rounded-xl bg-white/[0.03] border border-white/[0.06]">
-                  <div className="flex items-center gap-3 flex-1 min-w-0">
-                    <Facebook className="w-5 h-5 text-blue-400 shrink-0" />
-                    <div className="truncate">
-                      <p className="text-sm text-white font-medium truncate">{p.page_name}</p>
-                      <p className="text-xs text-gray-500">ID: {p.page_id}</p>
-                    </div>
-                  </div>
-                  {p.instagram_actor_id ? (
-                    <div className="flex items-center gap-2">
-                      {p.instagram_profile_pic && (
-                        <img src={p.instagram_profile_pic} alt="" className="w-6 h-6 rounded-full" />
-                      )}
-                      <div className="text-right">
-                        <p className="text-sm text-white">{p.instagram_username ? `@${p.instagram_username}` : `ID: ${p.instagram_actor_id}`}</p>
-                        <p className="text-xs text-emerald-400">IG linked</p>
+          {(() => {
+            // Show only the workspace's chosen page
+            const wsPageId = activeWorkspace?.meta_page_id;
+            const chosenPage = wsPageId ? socialPages.find((p) => p.page_id === wsPageId) : null;
+
+            if (socialLoading) {
+              return (
+                <div className="flex items-center gap-2 text-gray-500 text-xs py-4">
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  Loading...
+                </div>
+              );
+            }
+
+            if (chosenPage) {
+              return (
+                <div className="space-y-2">
+                  <div className="flex items-center gap-4 p-3 rounded-xl bg-white/[0.03] border border-white/[0.06]">
+                    <div className="flex items-center gap-3 flex-1 min-w-0">
+                      <Facebook className="w-5 h-5 text-blue-400 shrink-0" />
+                      <div className="truncate">
+                        <p className="text-sm text-white font-medium truncate">{chosenPage.page_name}</p>
+                        <p className="text-xs text-gray-500">ID: {chosenPage.page_id}</p>
                       </div>
                     </div>
-                  ) : (
-                    <span className="text-xs text-gray-600">No IG linked</span>
-                  )}
+                    {chosenPage.instagram_actor_id ? (
+                      <div className="flex items-center gap-2">
+                        {chosenPage.instagram_profile_pic && (
+                          <img src={chosenPage.instagram_profile_pic} alt="" className="w-6 h-6 rounded-full" />
+                        )}
+                        <div className="text-right">
+                          <p className="text-sm text-white">{chosenPage.instagram_username ? `@${chosenPage.instagram_username}` : `ID: ${chosenPage.instagram_actor_id}`}</p>
+                          <p className="text-xs text-emerald-400">IG linked</p>
+                        </div>
+                      </div>
+                    ) : (
+                      <span className="text-xs text-gray-600">No IG linked</span>
+                    )}
+                  </div>
+                  {(() => {
+                    if (waStatusLoading) {
+                      return (
+                        <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-white/[0.02] border border-white/[0.05] text-xs text-gray-500">
+                          <Loader2 className="w-3 h-3 animate-spin" />
+                          Checking Click-to-WhatsApp readiness...
+                        </div>
+                      );
+                    }
+                    if (!waStatus) return null;
+                    if (waStatus.connected) {
+                      return (
+                        <div className="flex items-center justify-between gap-3 px-3 py-2 rounded-lg bg-emerald-500/[0.06] border border-emerald-500/20">
+                          <div className="flex items-center gap-2">
+                            <span className="inline-flex items-center justify-center w-5 h-5 rounded-full bg-emerald-500/20 text-emerald-400 text-[10px] font-bold">✓</span>
+                            <div>
+                              <p className="text-xs font-medium text-emerald-300">Click-to-WhatsApp Ready</p>
+                              <p className="text-[11px] text-emerald-400/70">
+                                {waStatus.whatsapp_number
+                                  ? `Connected to +${waStatus.whatsapp_number}`
+                                  : "Page connected to WhatsApp Business"}
+                                {" · ads will use native CTWA optimization"}
+                              </p>
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    }
+                    return (
+                      <div className="flex items-start gap-3 px-3 py-2 rounded-lg bg-amber-500/[0.06] border border-amber-500/20">
+                        <span className="inline-flex items-center justify-center w-5 h-5 rounded-full bg-amber-500/20 text-amber-400 text-[10px] font-bold shrink-0 mt-0.5">?</span>
+                        <div className="flex-1 min-w-0">
+                          <p className="text-xs font-medium text-amber-300">Click-to-WhatsApp — Detection Inconclusive</p>
+                          <p className="text-[11px] text-amber-400/70 leading-snug">
+                            {waStatus.reason || "Couldn't confirm WhatsApp on this Page from the API."} Your ads will <strong className="text-amber-200">still attempt native CTWA</strong> when published — Meta decides, and we auto-fall-back to wa.me traffic only if Meta rejects.
+                          </p>
+                          <div className="flex flex-wrap gap-3 mt-1.5">
+                            <a
+                              href="https://business.facebook.com/latest/inbox/messaging_apps"
+                              target="_blank"
+                              rel="noreferrer"
+                              className="text-[11px] text-amber-300 hover:text-amber-200 underline"
+                            >
+                              Business Suite → Linked Accounts →
+                            </a>
+                            <a
+                              href={`https://www.facebook.com/${chosenPage.page_id}`}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="text-[11px] text-amber-300/80 hover:text-amber-200 underline"
+                            >
+                              Open Page → Settings → WhatsApp →
+                            </a>
+                          </div>
+                          {waStatus.signals && (
+                            <button
+                              onClick={() => setWaSignalsOpen((v) => !v)}
+                              className="text-[10px] text-amber-400/60 hover:text-amber-300 underline mt-1.5"
+                            >
+                              {waSignalsOpen ? "Hide" : "Show"} raw Meta API response (debug)
+                            </button>
+                          )}
+                          {waSignalsOpen && waStatus.signals && (
+                            <pre className="mt-1.5 p-2 rounded bg-black/40 text-[10px] text-amber-200/80 overflow-auto max-h-48 leading-tight">
+                              {JSON.stringify(waStatus.signals, null, 2)}
+                            </pre>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })()}
                 </div>
-              ))}
-            </div>
-          ) : (
-            <p className="text-xs text-gray-600">Click &quot;Refresh&quot; to load your social profiles.</p>
-          )}
+              );
+            }
+
+            if (wsPageId && !chosenPage && socialPages.length > 0) {
+              // Page ID set on workspace but not found in fetched pages — show ID only
+              return (
+                <div className="flex items-center gap-4 p-3 rounded-xl bg-white/[0.03] border border-white/[0.06]">
+                  <Facebook className="w-5 h-5 text-blue-400 shrink-0" />
+                  <div>
+                    <p className="text-sm text-white font-medium">Page ID: {wsPageId}</p>
+                    <p className="text-xs text-gray-500">Click &quot;Change Page&quot; to update</p>
+                  </div>
+                </div>
+              );
+            }
+
+            return (
+              <div className="text-center py-4">
+                <p className="text-xs text-gray-500 mb-2">No Facebook Page selected for this workspace.</p>
+                <button
+                  onClick={() => setPagePickerOpen(true)}
+                  className="text-xs text-violet-400 hover:text-violet-300 underline"
+                >
+                  Choose a Page
+                </button>
+              </div>
+            );
+          })()}
         </div>
       )}
 
@@ -491,6 +676,8 @@ export default function SettingsPage() {
                           setScraping(true);
                           const extras = extraUrls.split(",").map(u => u.trim()).filter(u => u.startsWith("http"));
                           try {
+                            // Save preferences first so website_url is in DB before scrape
+                            await api.upsertPreferences(prefs);
                             await api.scrapeWebsite(extras.length ? extras : undefined);
                             setBanner({ type: "success", text: `Analyzing ${1 + extras.length} page(s)… this takes ~20-30 seconds.` });
                             // Poll every 5s up to 60s until website_intel appears
@@ -500,11 +687,22 @@ export default function SettingsPage() {
                               try {
                                 const { data } = await api.getPreferences();
                                 if (data?.website_intel && data?.website_scraped_at !== websiteScrapedAt) {
-                                  setWebsiteIntel(data.website_intel);
+                                  const wi = data.website_intel;
+                                  setWebsiteIntel(wi);
                                   setWebsiteScrapedAt(data.website_scraped_at);
                                   setScraping(false);
                                   clearInterval(poll);
-                                  setBanner({ type: "success", text: data.website_intel.error ? "Analysis completed with errors." : "Website analyzed successfully! Check results below." });
+                                  // Auto-fill empty fields from website intelligence
+                                  if (wi && !wi.error) {
+                                    const audienceSignals = Array.isArray(wi.target_audience_signals) ? wi.target_audience_signals.join(", ") : "";
+                                    setPrefs((p: any) => ({
+                                      ...p,
+                                      business_description: p.business_description?.trim() || String(wi.key_offerings_summary || ""),
+                                      industry_niche: p.industry_niche?.trim() || String(wi.business_type || ""),
+                                      target_audience: p.target_audience?.trim() || audienceSignals,
+                                    }));
+                                  }
+                                  setBanner({ type: "success", text: wi.error ? "Analysis completed with errors." : "Website analyzed & fields auto-filled!" });
                                 } else if (attempts >= 12) {
                                   setScraping(false);
                                   clearInterval(poll);
@@ -521,10 +719,10 @@ export default function SettingsPage() {
                       {websiteIntel && !websiteIntel.error && (
                         <div className="p-3 rounded-xl bg-white/[0.03] border border-white/[0.06] space-y-2">
                           <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">Website Intelligence</p>
-                          {websiteIntel.business_type && (
+                          {Boolean(websiteIntel.business_type) && (
                             <p className="text-xs text-gray-300"><span className="text-gray-500">Type:</span> {String(websiteIntel.business_type)}</p>
                           )}
-                          {websiteIntel.key_offerings_summary && (
+                          {Boolean(websiteIntel.key_offerings_summary) && (
                             <p className="text-xs text-gray-300"><span className="text-gray-500">Summary:</span> {String(websiteIntel.key_offerings_summary)}</p>
                           )}
                           {Array.isArray(websiteIntel.products_or_services) && (websiteIntel.products_or_services as Array<{name?: string; description?: string; price?: string}>).length > 0 && (
@@ -547,7 +745,7 @@ export default function SettingsPage() {
                               </ul>
                             </div>
                           )}
-                          {websiteIntel.brand_tone && (
+                          {Boolean(websiteIntel.brand_tone) && (
                             <p className="text-xs text-gray-300"><span className="text-gray-500">Tone:</span> {String(websiteIntel.brand_tone)}</p>
                           )}
                         </div>
@@ -557,25 +755,16 @@ export default function SettingsPage() {
                 </div>
               </div>
               <div>
-                <label className="text-xs text-gray-500 mb-1 block flex items-center gap-1.5"><Globe className="w-3 h-3" />Country You Serve</label>
-                <select value={prefs.target_country} onChange={(e) => setPrefs(p => ({ ...p, target_country: e.target.value }))}
-                  className="w-full px-3 py-2 rounded-xl bg-white/[0.04] border border-white/[0.08] text-white text-sm focus:outline-none focus:border-violet-500/40 transition-all">
-                  <option value="PK">Pakistan</option>
-                  <option value="US">United States</option>
-                  <option value="GB">United Kingdom</option>
-                  <option value="AE">UAE</option>
-                  <option value="SA">Saudi Arabia</option>
-                  <option value="IN">India</option>
-                  <option value="CA">Canada</option>
-                  <option value="AU">Australia</option>
-                  <option value="DE">Germany</option>
-                  <option value="FR">France</option>
-                  <option value="TR">Turkey</option>
-                  <option value="MY">Malaysia</option>
-                  <option value="NG">Nigeria</option>
-                  <option value="KE">Kenya</option>
-                  <option value="BD">Bangladesh</option>
-                </select>
+                <label className="text-xs text-gray-500 mb-1.5 block flex items-center gap-1.5"><Globe className="w-3 h-3" />Countries You Serve</label>
+                <CountryPicker value={prefs.target_country} onChange={(v) => setPrefs(p => ({ ...p, target_country: v }))} />
+              </div>
+              <div>
+                <label className="text-xs text-gray-500 mb-1.5 block flex items-center gap-1.5"><MapPin className="w-3 h-3" />Target Cities (Optional)</label>
+                <CityPicker
+                  value={prefs.target_cities}
+                  onChange={(v) => setPrefs(p => ({ ...p, target_cities: v }))}
+                  countryCode={prefs.target_country === "WORLDWIDE" ? "" : prefs.target_country.split(",")[0] || ""}
+                />
               </div>
               <div>
                 <label className="text-xs text-gray-500 mb-1 block flex items-center gap-1.5"><Phone className="w-3 h-3" />WhatsApp Number</label>
@@ -714,6 +903,70 @@ export default function SettingsPage() {
           </div>
         )}
       </div>
+
+      {/* Account Picker Modal */}
+      <AccountPickerModal
+        open={pickerOpen}
+        onClose={() => setPickerOpen(false)}
+        onLinked={() => {
+          loadAccounts();
+          setBanner({ type: "success", text: "Ad accounts linked! Now choose your Facebook Page." });
+          setPagePickerOpen(true);
+        }}
+      />
+
+      {/* Page Picker Modal */}
+      <PagePickerModal
+        open={pagePickerOpen}
+        onClose={() => setPagePickerOpen(false)}
+        onSaved={async () => {
+          setBanner({ type: "success", text: "Facebook Page linked! Auto-filling business details..." });
+          // Refresh social profiles display
+          setSocialLoading(true);
+          api.fetchSocialIdentities()
+            .then(({ data }) => setSocialPages(data.pages || []))
+            .catch(() => setSocialPages([]))
+            .finally(() => setSocialLoading(false));
+
+          // Auto-fill from FB page intel
+          try {
+            const { data } = await api.getPageIntel();
+            const intel = data?.intel;
+            if (intel && typeof intel === "object") {
+              setPrefs((p) => ({
+                ...p,
+                business_name: p.business_name.trim() || String(intel.business_name || ""),
+                business_description: p.business_description.trim() || String(intel.business_description || ""),
+                industry_niche: p.industry_niche.trim() || String(intel.industry_niche || ""),
+                website_url: p.website_url.trim() || String(intel.website_url || ""),
+                whatsapp_number: p.whatsapp_number.trim() || String(intel.phone || ""),
+              }));
+              setBanner({ type: "success", text: "Business details auto-filled from your Facebook Page!" });
+
+              // If we got a website URL from the page, trigger a scrape for deeper intel
+              const pageWebsite = String(intel.website_url || "").trim();
+              if (pageWebsite && pageWebsite.startsWith("http")) {
+                try {
+                  setScraping(true);
+                  const { data: scrapeData } = await api.scrapeUrlForOnboarding(pageWebsite);
+                  const scrapeIntel = scrapeData?.intel;
+                  if (scrapeIntel && typeof scrapeIntel === "object") {
+                    setPrefs((p) => ({
+                      ...p,
+                      // Website scrape enriches — only fill what's still empty
+                      business_description: p.business_description.trim() || String(scrapeIntel.business_description || ""),
+                      industry_niche: p.industry_niche.trim() || String(scrapeIntel.industry_niche || ""),
+                      target_audience: p.target_audience.trim() || String(scrapeIntel.target_audience || ""),
+                    }));
+                    setBanner({ type: "success", text: "Business details enriched from website + Facebook Page!" });
+                  }
+                } catch { /* scrape failed — page data is enough */ }
+                finally { setScraping(false); }
+              }
+            }
+          } catch { /* page intel failed — user fills manually */ }
+        }}
+      />
     </div>
   );
 }

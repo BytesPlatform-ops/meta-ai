@@ -18,12 +18,14 @@ async def sync_audience_for_niche(
     user_id: str,
     niche: str,
     product_id: str | None = None,
+    workspace_id: str | None = None,
 ) -> dict:
     """
     Create a niche-scoped Custom Audience + 1% LAL.
 
     Only customers tagged with this exact niche (or product_id) are included.
     Returns audience IDs scoped to this niche.
+    Registers both audiences in meta_audiences for product-isolation tracking.
     """
     supabase = get_supabase()
 
@@ -83,6 +85,10 @@ async def sync_audience_for_niche(
 
     logger.info("Custom Audience for '%s': %s (%d users)", niche, custom_audience_id, len(customer_data))
 
+    # Register SEED audience
+    _register_audience(supabase, user_id, workspace_id, product_id,
+                       custom_audience_id, audience_name, "SEED")
+
     # 5. Create 1% LAL
     lal_audience_id = None
     lal_data = {}
@@ -92,6 +98,10 @@ async def sync_audience_for_niche(
         )
         lal_data = _parse_mcp_result(lal_result)
         lal_audience_id = lal_data.get("audience_id")
+        if lal_audience_id:
+            _register_audience(supabase, user_id, workspace_id, product_id,
+                               lal_audience_id, f"{audience_name} - 1% LAL", "LAL",
+                               origin_audience_id=custom_audience_id)
     except MCPError as e:
         logger.warning("LAL creation failed for niche '%s' (non-fatal): %s", niche, e)
         lal_data = {"error": str(e)}
@@ -146,6 +156,41 @@ def _collect_niche_customers(
     except Exception:
         pass
     return []
+
+
+def _register_audience(
+    supabase,
+    user_id: str,
+    workspace_id: str | None,
+    product_id: str | None,
+    meta_audience_id: str,
+    name: str,
+    audience_type: str,
+    origin_audience_id: str | None = None,
+    pixel_id: str | None = None,
+) -> None:
+    """Register a Meta audience in our registry for product-isolation tracking."""
+    try:
+        row: dict[str, Any] = {
+            "user_id": user_id,
+            "meta_audience_id": meta_audience_id,
+            "name": name,
+            "audience_type": audience_type,
+        }
+        if workspace_id:
+            row["workspace_id"] = workspace_id
+        if product_id:
+            row["product_id"] = product_id
+        if origin_audience_id:
+            row["origin_audience_id"] = origin_audience_id
+        if pixel_id:
+            row["pixel_id"] = pixel_id
+
+        supabase.table("meta_audiences").upsert(
+            row, on_conflict="meta_audience_id",
+        ).execute()
+    except Exception as e:
+        logger.warning("Failed to register audience %s: %s", meta_audience_id, e)
 
 
 def _parse_mcp_result(result: dict) -> dict:

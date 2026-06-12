@@ -51,7 +51,7 @@ CREATE TABLE IF NOT EXISTS public.ad_accounts (
     is_active           BOOLEAN NOT NULL DEFAULT TRUE,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE (user_id, meta_account_id)
+    UNIQUE (user_id, meta_account_id)  -- legacy; replaced by idx_ad_accounts_ws_meta below
 );
 
 DROP TRIGGER IF EXISTS ad_accounts_updated_at ON public.ad_accounts;
@@ -181,6 +181,9 @@ BEGIN
         NEW.raw_user_meta_data->>'full_name',
         NEW.raw_user_meta_data->>'avatar_url'
     );
+    -- Auto-create default workspace for every new user
+    INSERT INTO public.workspaces (user_id, name)
+    VALUES (NEW.id, 'My First Business');
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
@@ -196,7 +199,8 @@ CREATE TRIGGER on_auth_user_created
 -- ============================================================
 CREATE TABLE IF NOT EXISTS public.user_preferences (
     id                  UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    user_id             UUID NOT NULL UNIQUE REFERENCES public.users(id) ON DELETE CASCADE,
+    user_id             UUID NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+    workspace_id        UUID,
     posting_frequency   TEXT NOT NULL DEFAULT 'manual_only'
         CHECK (posting_frequency IN ('daily', '3x_weekly', 'weekends_only', 'manual_only')),
     content_tone        TEXT NOT NULL DEFAULT 'professional'
@@ -514,6 +518,7 @@ ALTER TABLE public.content_drafts ADD COLUMN IF NOT EXISTS pixel_id TEXT DEFAULT
 ALTER TABLE public.content_drafts ADD COLUMN IF NOT EXISTS conversion_event TEXT DEFAULT NULL;
 ALTER TABLE public.content_drafts ADD COLUMN IF NOT EXISTS thumbnail_url TEXT DEFAULT NULL;
 ALTER TABLE public.content_drafts ADD COLUMN IF NOT EXISTS destination_type TEXT DEFAULT 'WEBSITE';
+ALTER TABLE public.content_drafts ADD COLUMN IF NOT EXISTS campaign_objective TEXT DEFAULT NULL;
 ALTER TABLE public.content_drafts ADD COLUMN IF NOT EXISTS whatsapp_number TEXT DEFAULT NULL;
 
 -- Flexible creative testing: array of media items [{type:'image'|'video', url:string, thumbnail_url?:string}]
@@ -538,7 +543,8 @@ DO $$ BEGIN
         'apply_cost_cap',
         'mutate_winner',
         'shift_budget',
-        'create_lookalike'
+        'create_lookalike',
+        'create_engagement_audience'
     );
 EXCEPTION WHEN duplicate_object THEN NULL;
 END $$;
@@ -611,6 +617,271 @@ ALTER TABLE public.content_drafts ADD COLUMN IF NOT EXISTS lead_form_id TEXT DEF
 -- Multi-messaging & phone call destination fields
 ALTER TABLE public.content_drafts ADD COLUMN IF NOT EXISTS selected_messaging_apps JSONB DEFAULT NULL;
 ALTER TABLE public.content_drafts ADD COLUMN IF NOT EXISTS call_phone_number TEXT DEFAULT NULL;
+
+-- ============================================================
+-- WORKSPACES — Agency model (1 User → Many Workspaces)
+-- ============================================================
+CREATE TABLE IF NOT EXISTS public.workspaces (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id         UUID NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+    name            TEXT NOT NULL DEFAULT 'My First Business',
+    meta_ad_account_id  TEXT,
+    meta_page_id        TEXT,
+    meta_pixel_id       TEXT,
+    meta_ig_actor_id    TEXT,
+    meta_access_token   TEXT,
+    business_name       TEXT,
+    business_description TEXT,
+    target_audience     TEXT,
+    website_url         TEXT,
+    target_country      TEXT DEFAULT 'PK',
+    industry_niche      TEXT,
+    website_intel       JSONB DEFAULT NULL,
+    website_scraped_at  TIMESTAMPTZ DEFAULT NULL,
+    tracking_mode       TEXT DEFAULT 'whatsapp_cod',
+    is_active       BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+DROP TRIGGER IF EXISTS workspaces_updated_at ON public.workspaces;
+CREATE TRIGGER workspaces_updated_at
+    BEFORE UPDATE ON public.workspaces
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at();
+
+CREATE INDEX IF NOT EXISTS idx_workspaces_user_id ON public.workspaces(user_id);
+
+ALTER TABLE public.workspaces ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "workspaces: own rows" ON public.workspaces;
+CREATE POLICY "workspaces: own rows" ON public.workspaces
+    USING (user_id = auth.uid()) WITH CHECK (user_id = auth.uid());
+
+DROP POLICY IF EXISTS "service_role: full access workspaces" ON public.workspaces;
+CREATE POLICY "service_role: full access workspaces" ON public.workspaces
+    FOR ALL TO service_role USING (true) WITH CHECK (true);
+
+-- workspace_id FK on business tables
+ALTER TABLE public.ad_accounts ADD COLUMN IF NOT EXISTS workspace_id UUID REFERENCES public.workspaces(id) ON DELETE CASCADE;
+ALTER TABLE public.products ADD COLUMN IF NOT EXISTS workspace_id UUID REFERENCES public.workspaces(id) ON DELETE CASCADE;
+ALTER TABLE public.content_drafts ADD COLUMN IF NOT EXISTS workspace_id UUID REFERENCES public.workspaces(id) ON DELETE CASCADE;
+ALTER TABLE public.campaign_logs ADD COLUMN IF NOT EXISTS workspace_id UUID REFERENCES public.workspaces(id) ON DELETE CASCADE;
+ALTER TABLE public.campaign_suggestions ADD COLUMN IF NOT EXISTS workspace_id UUID REFERENCES public.workspaces(id) ON DELETE CASCADE;
+ALTER TABLE public.content_strategies ADD COLUMN IF NOT EXISTS workspace_id UUID REFERENCES public.workspaces(id) ON DELETE CASCADE;
+ALTER TABLE public.optimization_proposals ADD COLUMN IF NOT EXISTS workspace_id UUID REFERENCES public.workspaces(id) ON DELETE CASCADE;
+ALTER TABLE public.account_audits ADD COLUMN IF NOT EXISTS workspace_id UUID REFERENCES public.workspaces(id) ON DELETE CASCADE;
+ALTER TABLE public.lead_forms ADD COLUMN IF NOT EXISTS workspace_id UUID REFERENCES public.workspaces(id) ON DELETE CASCADE;
+
+CREATE INDEX IF NOT EXISTS idx_ad_accounts_workspace_id     ON public.ad_accounts(workspace_id);
+CREATE INDEX IF NOT EXISTS idx_products_workspace_id        ON public.products(workspace_id);
+CREATE INDEX IF NOT EXISTS idx_content_drafts_workspace_id  ON public.content_drafts(workspace_id);
+CREATE INDEX IF NOT EXISTS idx_campaign_logs_workspace_id   ON public.campaign_logs(workspace_id);
+
+-- Replace (user_id, meta_account_id) uniqueness with per-workspace uniqueness.
+-- IMPORTANT: full (no WHERE predicate) unique index — partial unique indexes
+-- can't be used as ON CONFLICT targets via PostgREST upsert without also
+-- repeating the predicate, which PostgREST doesn't expose. We previously
+-- had `WHERE workspace_id IS NOT NULL` which broke link_accounts upserts
+-- with PG error 42P10 ("no unique or exclusion constraint matching").
+-- The workspace_id column is functionally required across the app now —
+-- the partial predicate added no integrity value.
+ALTER TABLE public.ad_accounts DROP CONSTRAINT IF EXISTS ad_accounts_user_id_meta_account_id_key;
+DROP INDEX IF EXISTS public.idx_ad_accounts_ws_meta;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ad_accounts_ws_meta
+    ON public.ad_accounts(workspace_id, meta_account_id);
+
+-- ============================================================
+-- CUSTOMERS — niche-scoped customer data for Custom Audience + LAL pipeline
+-- ============================================================
+CREATE TABLE IF NOT EXISTS public.customers (
+    id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id     UUID NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+    email       TEXT,
+    phone       TEXT,
+    niche       TEXT,
+    product_id  UUID REFERENCES public.products(id) ON DELETE SET NULL,
+    source      TEXT DEFAULT 'manual',
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT customers_contact_check CHECK (email IS NOT NULL OR phone IS NOT NULL)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_customers_dedup
+    ON public.customers (user_id, COALESCE(email, ''), COALESCE(phone, ''), COALESCE(niche, ''));
+CREATE INDEX IF NOT EXISTS idx_customers_user_niche
+    ON public.customers (user_id, niche);
+CREATE INDEX IF NOT EXISTS idx_customers_user_product
+    ON public.customers (user_id, product_id);
+
+ALTER TABLE public.customers ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "customers: own rows" ON public.customers;
+CREATE POLICY "customers: own rows" ON public.customers
+    USING (user_id = auth.uid()) WITH CHECK (user_id = auth.uid());
+
+DROP POLICY IF EXISTS "service_role: full access customers" ON public.customers;
+CREATE POLICY "service_role: full access customers" ON public.customers
+    FOR ALL TO service_role USING (true) WITH CHECK (true);
+
+ALTER TABLE public.customers ADD COLUMN IF NOT EXISTS workspace_id UUID REFERENCES public.workspaces(id) ON DELETE CASCADE;
+CREATE INDEX IF NOT EXISTS idx_customers_workspace_id ON public.customers(workspace_id);
+
+-- Hiring Ads (Employment HEC category)
+ALTER TABLE public.content_drafts ADD COLUMN IF NOT EXISTS is_employment_ad BOOLEAN DEFAULT FALSE;
+ALTER TABLE public.content_drafts ADD COLUMN IF NOT EXISTS hiring_data JSONB DEFAULT NULL;
+ALTER TABLE public.content_drafts ADD COLUMN IF NOT EXISTS job_id UUID DEFAULT NULL;
+
+-- ============================================================
+-- JOBS — Hiring positions for 1-Click Recruitment Ads
+-- ============================================================
+CREATE TABLE IF NOT EXISTS public.jobs (
+    id                      UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id                 UUID NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+    workspace_id            UUID REFERENCES public.workspaces(id) ON DELETE CASCADE,
+
+    -- Core info
+    job_title               TEXT NOT NULL,
+    department              TEXT,
+    company_name            TEXT,
+    company_logo_url        TEXT,
+
+    -- Work arrangement
+    work_mode               TEXT DEFAULT 'onsite',        -- onsite | remote | hybrid
+    location                TEXT,                         -- city/area, e.g. "Lahore, Pakistan"
+    employment_type         TEXT DEFAULT 'full_time',     -- full_time | part_time | contract | internship | freelance
+
+    -- Compensation
+    salary_min              NUMERIC(12, 2),
+    salary_max              NUMERIC(12, 2),
+    salary_currency         TEXT DEFAULT 'PKR',
+    salary_period           TEXT DEFAULT 'month',         -- month | year | hour | project
+    perks                   TEXT,                         -- e.g. "Medical + Transport + Lunch"
+
+    -- Requirements & Role
+    experience_level        TEXT DEFAULT 'entry',         -- entry | mid | senior | lead | executive
+    experience_years_min    INT DEFAULT 0,
+    experience_years_max    INT,
+    education_level         TEXT,                         -- e.g. "O/A Levels", "Bachelor's", "Any"
+    skills                  TEXT[],                       -- array of required skills
+    target_candidate_profile TEXT,                        -- creative filter: "O/A level grads, fluent English"
+    requirements            TEXT,                         -- detailed requirements
+    responsibilities        TEXT,                         -- detailed responsibilities
+
+    -- Application
+    application_url         TEXT,                         -- external apply link (optional)
+    application_email       TEXT,                         -- email to apply
+
+    -- Targeting
+    target_country          TEXT DEFAULT 'PK',
+    target_cities           JSONB,                        -- [{name: "Lahore", key: "123"}]
+
+    -- Meta
+    status                  TEXT DEFAULT 'open',          -- open | closed | draft
+    is_active               BOOLEAN DEFAULT TRUE,
+    tags                    TEXT[] DEFAULT '{}',
+
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_jobs_user_id ON public.jobs(user_id);
+CREATE INDEX IF NOT EXISTS idx_jobs_workspace_id ON public.jobs(workspace_id);
+
+ALTER TABLE public.jobs ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "jobs: own rows" ON public.jobs;
+CREATE POLICY "jobs: own rows" ON public.jobs
+    USING (user_id = auth.uid()) WITH CHECK (user_id = auth.uid());
+
+DROP POLICY IF EXISTS "service_role: full access jobs" ON public.jobs;
+CREATE POLICY "service_role: full access jobs" ON public.jobs
+    FOR ALL TO service_role USING (true) WITH CHECK (true);
+
+-- ============================================================
+-- META AUDIENCES — Product-aware audience registry
+-- Maps every Meta audience back to its owning product
+-- to prevent cross-product audience contamination.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS public.meta_audiences (
+    id                  UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id             UUID NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+    workspace_id        UUID REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    product_id          UUID REFERENCES public.products(id) ON DELETE SET NULL,
+    meta_audience_id    TEXT NOT NULL,
+    name                TEXT NOT NULL,
+    audience_type       TEXT NOT NULL DEFAULT 'SEED'
+        CHECK (audience_type IN ('SEED', 'LAL', 'RETARGETING', 'EXCLUSION', 'ENGAGEMENT')),
+    origin_audience_id  TEXT,
+    pixel_id            TEXT,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_meta_audiences_meta_id
+    ON public.meta_audiences (meta_audience_id);
+CREATE INDEX IF NOT EXISTS idx_meta_audiences_product
+    ON public.meta_audiences (product_id);
+CREATE INDEX IF NOT EXISTS idx_meta_audiences_workspace
+    ON public.meta_audiences (workspace_id);
+
+ALTER TABLE public.meta_audiences ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "meta_audiences: own rows" ON public.meta_audiences;
+CREATE POLICY "meta_audiences: own rows" ON public.meta_audiences
+    USING (user_id = auth.uid())
+    WITH CHECK (user_id = auth.uid());
+
+DROP POLICY IF EXISTS "service_role: full access meta_audiences" ON public.meta_audiences;
+CREATE POLICY "service_role: full access meta_audiences" ON public.meta_audiences
+    FOR ALL TO service_role USING (true) WITH CHECK (true);
+
+-- City-level targeting
+ALTER TABLE public.user_preferences ADD COLUMN IF NOT EXISTS target_cities JSONB DEFAULT '[]'::jsonb;
+ALTER TABLE public.products ADD COLUMN IF NOT EXISTS target_cities JSONB DEFAULT NULL;
+
+-- ============================================================
+-- SAC RECONCILIATION — global learning of which interests Meta
+-- silently strips under each Special Ad Category. Populated by
+-- the post-publish reconciler so future drafts skip known-bad
+-- interests automatically across the whole platform.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS public.sac_blocked_interests (
+    id                  UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    interest_id         TEXT NOT NULL,
+    interest_name       TEXT NOT NULL,
+    sac_category        TEXT NOT NULL,
+    first_blocked_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_blocked_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    block_count         INTEGER NOT NULL DEFAULT 1,
+    source              TEXT NOT NULL DEFAULT 'reconciliation'
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sac_blocked_interests_unique
+    ON public.sac_blocked_interests (interest_id, sac_category);
+CREATE INDEX IF NOT EXISTS idx_sac_blocked_interests_category
+    ON public.sac_blocked_interests (sac_category);
+
+-- Service-role-only writes; everyone can read so MCP/targeting can filter.
+ALTER TABLE public.sac_blocked_interests ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "sac_blocked_interests: read all" ON public.sac_blocked_interests;
+CREATE POLICY "sac_blocked_interests: read all" ON public.sac_blocked_interests
+    FOR SELECT USING (true);
+
+DROP POLICY IF EXISTS "service_role: full access sac_blocked_interests" ON public.sac_blocked_interests;
+CREATE POLICY "service_role: full access sac_blocked_interests" ON public.sac_blocked_interests
+    FOR ALL TO service_role USING (true) WITH CHECK (true);
+
+-- Per-draft reconciliation outcome:
+--   actual_targeting — full targeting object Meta is actually running
+--   targeting_diff   — { stripped_interests:[…], severity:"…", … } summary
+ALTER TABLE public.content_drafts ADD COLUMN IF NOT EXISTS actual_targeting JSONB DEFAULT NULL;
+ALTER TABLE public.content_drafts ADD COLUMN IF NOT EXISTS targeting_diff JSONB DEFAULT NULL;
+
+-- Phase B — auto-recovery state. When the reconciler sees severity=heavy or
+-- total_strip, sac_recovery regenerates replacement interests and PATCHes the
+-- live ad set. Status values: pending | recovered | failed | no_alternatives.
+ALTER TABLE public.content_drafts ADD COLUMN IF NOT EXISTS auto_recovery_status TEXT DEFAULT NULL;
+ALTER TABLE public.content_drafts ADD COLUMN IF NOT EXISTS auto_recovery_attempts INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE public.content_drafts ADD COLUMN IF NOT EXISTS recovered_interests JSONB DEFAULT NULL;
 
 -- ============================================================
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public

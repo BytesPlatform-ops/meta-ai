@@ -20,7 +20,7 @@ client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
 
 # Meta Graph API supported question types for Instant Forms
 VALID_QUESTION_TYPES = {
-    "FULL_NAME", "EMAIL", "PHONE_NUMBER", "CITY",
+    "FULL_NAME", "EMAIL", "PHONE", "CITY",
     "COMPANY_NAME", "JOB_TITLE", "STATE", "ZIP",
     "STREET_ADDRESS", "DATE_OF_BIRTH", "CUSTOM",
 }
@@ -34,22 +34,22 @@ maximises completion rate while capturing the data the advertiser needs.
 Rules:
 - Return 3-5 fields MAXIMUM. Every extra field drops conversion rate ~10%.
 - ALWAYS include FULL_NAME as the first field (Meta pre-fills it → zero friction).
-- Include PHONE_NUMBER or EMAIL (pick the one most relevant to the business model).
+- Include PHONE or EMAIL (pick the one most relevant to the business model).
 - Add 1-2 strategic CUSTOM questions that qualify leads WITHOUT creating friction.
   Good custom questions: single-select ("Which product interests you?"), short text ("When do you need this?").
   Bad custom questions: essay-type, sensitive financial data, anything requiring thought.
-- For WhatsApp/COD businesses: prefer PHONE_NUMBER over EMAIL.
-- For e-commerce/SaaS: prefer EMAIL over PHONE_NUMBER.
+- For WhatsApp/COD businesses: prefer PHONE over EMAIL.
+- For e-commerce/SaaS: prefer EMAIL over PHONE.
 - Form name should be professional and include the product/brand name.
 
-Valid question types: FULL_NAME, EMAIL, PHONE_NUMBER, CITY, COMPANY_NAME, JOB_TITLE, CUSTOM
+Valid question types: FULL_NAME, EMAIL, PHONE, CITY, COMPANY_NAME, JOB_TITLE, CUSTOM
 
 Return ONLY valid JSON (no markdown, no code fences) in this exact format:
 {
   "form_name": "Product Inquiry — Brand Name",
   "questions": [
     {"type": "FULL_NAME", "key": "full_name"},
-    {"type": "PHONE_NUMBER", "key": "phone_number"},
+    {"type": "PHONE", "key": "phone_number"},
     {"type": "CUSTOM", "key": "product_interest", "label": "Which flavor are you interested in?"}
   ],
   "reasoning": "Brief explanation of why these fields were chosen"
@@ -208,7 +208,7 @@ def _default_form() -> dict:
         "form_name": "Lead Form",
         "questions": [
             {"type": "FULL_NAME", "key": "full_name"},
-            {"type": "PHONE_NUMBER", "key": "phone_number"},
+            {"type": "PHONE", "key": "phone_number"},
             {"type": "EMAIL", "key": "email"},
         ],
         "reasoning": "Default form — AI generation was not available.",

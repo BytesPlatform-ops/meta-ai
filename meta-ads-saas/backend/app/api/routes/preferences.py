@@ -11,7 +11,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from pydantic import BaseModel
 import httpx as _httpx
 
-from ...api.deps import get_current_user_id
+from ...api.deps import get_current_user_id, get_workspace_id
 from ...db.supabase_client import get_supabase
 from ...core.config import get_settings
 from ...services.mcp_client import mcp_client, MCPError
@@ -36,6 +36,7 @@ class PreferencesPayload(BaseModel):
     industry_niche: str | None = None
     whatsapp_number: str | None = None
     ad_placements: str = "BOTH"  # BOTH | FACEBOOK_ONLY | INSTAGRAM_ONLY
+    target_cities: list[dict] = []  # [{key, name, region?, country_code?}] from Meta geo search
 
 
 VALID_FREQUENCIES = {"daily", "3x_weekly", "weekends_only", "manual_only"}
@@ -44,13 +45,17 @@ VALID_BUDGETS = {"conservative_$10", "moderate_$30", "aggressive_$50", "conserva
 
 
 @router.get("")
-async def get_preferences(user_id: str = Depends(get_current_user_id)):
-    """Returns the user's preferences, or null if not yet configured."""
+async def get_preferences(
+    user_id: str = Depends(get_current_user_id),
+    workspace_id: str = Depends(get_workspace_id),
+):
+    """Returns the workspace's preferences, or null if not yet configured."""
     supabase = get_supabase()
     result = (
         supabase.table("user_preferences")
         .select("*")
         .eq("user_id", user_id)
+        .eq("workspace_id", workspace_id)
         .execute()
     )
     return result.data[0] if result.data else None
@@ -76,16 +81,16 @@ def _extract_mcp_content(result: dict) -> str:
     return json.dumps(result) if result else ""
 
 
-async def _scrape_and_store(user_id: str, website_url: str):
+async def _scrape_and_store(user_id: str, website_url: str, workspace_id: str | None = None):
     """Background task: scrape website via MCP, structure with OpenAI, save to DB."""
     import traceback as _tb
     try:
-        await _scrape_and_store_inner(user_id, website_url)
+        await _scrape_and_store_inner(user_id, website_url, workspace_id)
     except Exception:
         logger.error("_scrape_and_store CRASHED:\n%s", _tb.format_exc())
 
 
-async def _scrape_and_store_inner(user_id: str, website_url: str):
+async def _scrape_and_store_inner(user_id: str, website_url: str, workspace_id: str | None = None):
     """Scrape one or more URLs (comma-separated) via MCP, structure with OpenAI, save to DB."""
     from openai import AsyncOpenAI
     settings = get_settings()
@@ -119,10 +124,13 @@ async def _scrape_and_store_inner(user_id: str, website_url: str):
         if not all_content or len(all_content) < 50:
             logger.warning("Website scrape returned no/little content for %s (got %d chars)", primary_url, len(all_content))
             supabase = get_supabase()
-            supabase.table("user_preferences").update({
+            q = supabase.table("user_preferences").update({
                 "website_intel": {"error": "Could not extract content from website", "url": primary_url, "urls_scraped": urls},
                 "website_scraped_at": datetime.now(timezone.utc).isoformat(),
-            }).eq("user_id", user_id).execute()
+            }).eq("user_id", user_id)
+            if workspace_id:
+                q = q.eq("workspace_id", workspace_id)
+            q.execute()
             return
 
         # Truncate combined content for LLM context
@@ -150,10 +158,13 @@ async def _scrape_and_store_inner(user_id: str, website_url: str):
 
     # Save intel to preferences
     try:
-        supabase.table("user_preferences").update({
+        q = supabase.table("user_preferences").update({
             "website_intel": intel,
             "website_scraped_at": datetime.now(timezone.utc).isoformat(),
-        }).eq("user_id", user_id).execute()
+        }).eq("user_id", user_id)
+        if workspace_id:
+            q = q.eq("workspace_id", workspace_id)
+        q.execute()
     except Exception as e:
         logger.error("Failed to save website_intel: %s", e)
 
@@ -190,7 +201,7 @@ async def _scrape_and_store_inner(user_id: str, website_url: str):
                 btype = (intel.get("business_type") or "").lower()
                 ptype = "saas" if "saas" in btype else "service" if "service" in btype or "portfolio" in btype else "physical" if "e-commerce" in btype else "digital"
             try:
-                supabase.table("products").insert({
+                row = {
                     "user_id": user_id,
                     "name": name,
                     "description": p.get("description", ""),
@@ -199,7 +210,10 @@ async def _scrape_and_store_inner(user_id: str, website_url: str):
                     "landing_url": product_landing,
                     "product_type": ptype,
                     "is_active": True,
-                }).execute()
+                }
+                if workspace_id:
+                    row["workspace_id"] = workspace_id
+                supabase.table("products").insert(row).execute()
                 logger.info("Auto-created product '%s' for user %s (landing: %s)", name, user_id, product_landing)
             except Exception as e:
                 logger.warning("Failed to auto-create product '%s': %s", name, e)
@@ -210,6 +224,7 @@ async def upsert_preferences(
     payload: PreferencesPayload,
     background_tasks: BackgroundTasks,
     user_id: str = Depends(get_current_user_id),
+    workspace_id: str = Depends(get_workspace_id),
 ):
     """Create or update user preferences (wizard submit)."""
     # Validate enums
@@ -223,6 +238,7 @@ async def upsert_preferences(
     supabase = get_supabase()
     data = {
         "user_id": user_id,
+        "workspace_id": workspace_id,
         "business_name": payload.business_name,
         "business_description": payload.business_description,
         "target_audience": payload.target_audience,
@@ -236,6 +252,7 @@ async def upsert_preferences(
         "industry_niche": payload.industry_niche,
         "whatsapp_number": payload.whatsapp_number,
         "target_country": payload.target_country,
+        "target_cities": json.dumps(payload.target_cities),
         "setup_completed_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -250,7 +267,7 @@ async def upsert_preferences(
         "Prefer": "return=representation,resolution=merge-duplicates",
     }
     resp = _httpx.post(
-        f"{base}/rest/v1/user_preferences?on_conflict=user_id",
+        f"{base}/rest/v1/user_preferences?on_conflict=user_id,workspace_id",
         headers=headers,
         json=data,
         timeout=10,
@@ -258,13 +275,23 @@ async def upsert_preferences(
     logger.info("Upsert prefs status=%s body=%s", resp.status_code, resp.text[:500])
     saved = resp.json()[0] if resp.status_code in (200, 201) and resp.json() else data
 
-    # Trigger website scraping if URL provided and not recently scraped
+    # Sync business fields to workspace so workspace-first queries get fresh data
+    ws_sync = {}
+    for field in ("business_name", "business_description", "target_audience",
+                   "website_url", "target_country", "industry_niche"):
+        val = getattr(payload, field, None)
+        if val is not None:
+            ws_sync[field] = val
+    if ws_sync:
+        try:
+            supabase.table("workspaces").update(ws_sync).eq("id", workspace_id).execute()
+        except Exception as e:
+            logger.warning("Failed to sync prefs to workspace %s: %s", workspace_id, e)
+
+    # Trigger website scraping if URL provided
+    # Always scrape on save — covers new workspaces, URL changes, and first-time setups
     if payload.website_url and payload.website_url.startswith("http"):
-        existing_intel = saved.get("website_intel")
-        existing_url_scraped = saved.get("website_scraped_at")
-        # Scrape if never scraped or URL likely changed (no easy diff, just re-scrape)
-        if not existing_intel or not existing_url_scraped:
-            background_tasks.add_task(_scrape_and_store, user_id, payload.website_url)
+        background_tasks.add_task(_scrape_and_store, user_id, payload.website_url, workspace_id)
 
     return saved
 
@@ -277,6 +304,7 @@ class ScrapeWebsitePayload(BaseModel):
 async def trigger_website_scrape(
     payload: ScrapeWebsitePayload | None = None,
     user_id: str = Depends(get_current_user_id),
+    workspace_id: str = Depends(get_workspace_id),
 ):
     """Force re-scrape of the user's website URL(s).
 
@@ -284,7 +312,7 @@ async def trigger_website_scrape(
     additional pages alongside the main website URL.
     """
     supabase = get_supabase()
-    result = supabase.table("user_preferences").select("website_url").eq("user_id", user_id).execute()
+    result = supabase.table("user_preferences").select("website_url").eq("user_id", user_id).eq("workspace_id", workspace_id).execute()
     main_url = result.data[0].get("website_url") if result.data else None
 
     extra_urls = payload.urls if payload and payload.urls else []
@@ -301,5 +329,69 @@ async def trigger_website_scrape(
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "No website URL configured and no URLs provided")
 
     combined = ", ".join(all_urls)
-    await _scrape_and_store(user_id, combined)
+    await _scrape_and_store(user_id, combined, workspace_id)
     return {"status": "done", "message": f"Analyzed {len(all_urls)} page(s)", "urls_scraped": all_urls}
+
+
+class ScrapeUrlPayload(BaseModel):
+    url: str
+
+
+@router.post("/scrape-url")
+async def scrape_url_for_onboarding(
+    payload: ScrapeUrlPayload,
+    user_id: str = Depends(get_current_user_id),
+):
+    """
+    Lightweight scrape endpoint for onboarding — takes a raw URL, returns
+    structured business intel without requiring a workspace or saved preferences.
+    Used during workspace creation to auto-fill fields.
+    """
+    url = payload.url.strip()
+    if not url or not url.startswith("http"):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "A valid URL is required")
+
+    from openai import AsyncOpenAI
+    settings = get_settings()
+    openai_client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+
+    # 1. Scrape via MCP
+    try:
+        raw = await mcp_client.scrape_website(url)
+        raw_result = _extract_mcp_content(raw)
+        try:
+            parsed = json.loads(raw_result) if isinstance(raw_result, str) else raw_result
+            if isinstance(parsed, dict) and "pages" in parsed:
+                parts = [p.get("raw_content", "") for p in parsed["pages"] if p.get("raw_content")]
+                content = "\n\n".join(parts) if parts else raw_result
+            else:
+                content = parsed.get("raw_content", raw_result) if isinstance(parsed, dict) else raw_result
+        except (json.JSONDecodeError, TypeError):
+            content = raw_result
+    except Exception as e:
+        logger.warning("Onboarding scrape failed for %s: %s", url, e)
+        return {"intel": None, "error": f"Could not scrape website: {e}"}
+
+    if not content or len(content) < 50:
+        return {"intel": None, "error": "Could not extract meaningful content from this URL"}
+
+    # 2. Structure with OpenAI
+    try:
+        resp = await openai_client.chat.completions.create(
+            model=settings.CHEAP_FAST_MODEL,
+            messages=[
+                {"role": "system", "content": "Extract structured business intelligence from this website content. Return ONLY valid JSON."},
+                {"role": "user", "content": f"""Analyze this website and extract business details:\n\n{content[:6000]}\n\nReturn JSON:\n{{\n  "business_name": "the business/brand name",\n  "business_description": "2-3 sentence description of what they do",\n  "industry_niche": "e.g. DTC Skincare, SaaS, E-commerce Fashion",\n  "target_audience": "who they serve, e.g. Women 25-45, Small businesses",\n  "brand_tone": "professional | casual | luxury | friendly | technical | educational | humorous",\n  "business_type": "e-commerce | service | saas | portfolio | other",\n  "value_propositions": ["array of key selling points"],\n  "products_or_services": [{{"name": "...", "description": "...", "price": "...", "product_type": "physical | digital | saas | service"}}]\n}}"""},
+            ],
+            max_completion_tokens=1500,
+            response_format={"type": "json_object"},
+        )
+        text = resp.choices[0].message.content.strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+        intel = json.loads(text)
+    except Exception as e:
+        logger.error("Onboarding intel extraction failed for %s: %s", url, e)
+        return {"intel": None, "error": f"Failed to analyze website: {e}"}
+
+    return {"intel": intel}

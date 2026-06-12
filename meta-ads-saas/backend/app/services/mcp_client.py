@@ -44,6 +44,7 @@ _CACHEABLE_TOOLS = {
     "fetch_ad_account_pixels",
     "fetch_pixel_performance",
     "fetch_social_identities",
+    "check_page_whatsapp",
 }
 
 # TTL per tool (seconds) — heavier/slower tools get longer cache
@@ -55,6 +56,7 @@ _TOOL_TTL = {
     "saas_page_posts": 60,
     "get_deep_ad_insights": 30,
     "fetch_social_identities": 300,
+    "check_page_whatsapp": 300,
 }
 _DEFAULT_TTL = 30
 
@@ -232,6 +234,22 @@ class MCPClient:
             args["until"] = until
         return await self.call_tool("saas_account_overview", args, user_access_token)
 
+    async def get_dashboard_metrics(
+        self, ad_account_id: str, user_access_token: str,
+        page_id: str | None = None,
+        date_preset: str = "maximum",
+        since: str | None = None, until: str | None = None,
+        status_filter: str = "active",
+    ) -> dict:
+        """Dashboard metrics: total account + page-specific spend."""
+        args: dict = {"ad_account_id": ad_account_id, "date_preset": date_preset, "status_filter": status_filter}
+        if page_id:
+            args["page_id"] = page_id
+        if since and until:
+            args["since"] = since
+            args["until"] = until
+        return await self.call_tool("saas_dashboard_metrics", args, user_access_token)
+
     async def list_campaigns(
         self,
         ad_account_id: str,
@@ -239,12 +257,18 @@ class MCPClient:
         status_filter: str = "all",
         limit: int = 25,
         since: str | None = None, until: str | None = None,
+        page_id: str | None = None,
+        baselines: dict | None = None,
     ) -> dict:
-        """List campaigns with status, budget, and 7d performance metrics."""
+        """List campaigns with status, budget, and 30d performance metrics."""
         args: dict = {"ad_account_id": ad_account_id, "status_filter": status_filter, "limit": limit}
         if since and until:
             args["since"] = since
             args["until"] = until
+        if page_id:
+            args["page_id"] = page_id
+        if baselines:
+            args["baselines"] = baselines
         return await self.call_tool("saas_list_campaigns", args, user_access_token)
 
     async def get_campaign_insights(
@@ -268,12 +292,15 @@ class MCPClient:
         date_preset: str = "last_7d",
         status_filter: str = "all",
         since: str | None = None, until: str | None = None,
+        baselines: dict | None = None,
     ) -> dict:
         """List all ads in a campaign with individual performance and verdicts."""
         args: dict = {"campaign_id": campaign_id, "date_preset": date_preset, "status_filter": status_filter}
         if since and until:
             args["since"] = since
             args["until"] = until
+        if baselines:
+            args["baselines"] = baselines
         return await self.call_tool("saas_list_ads", args, user_access_token)
 
     # ------------------------------------------------------------------
@@ -336,6 +363,26 @@ class MCPClient:
                 "entity_id": adset_id,
                 "entity_type": "adset",
                 "new_budget_dollars": daily_budget_cents / 100,
+            },
+            user_access_token,
+        )
+
+    async def replace_adset_interests(
+        self,
+        adset_id: str,
+        interests: list[dict],
+        user_access_token: str,
+    ) -> dict:
+        """Phase B SAC auto-recovery: swap the ``flexible_spec[0].interests``
+        on a live ad set without touching geo/age/audiences/etc. ``interests``
+        is a list of {"id": str, "name": str} objects (post-validation through
+        Meta's targeting search API)."""
+        import json as _json
+        return await self.call_tool(
+            "update_adset_targeting",
+            {
+                "adset_id": adset_id,
+                "interests_json": _json.dumps(interests),
             },
             user_access_token,
         )
@@ -417,6 +464,64 @@ class MCPClient:
                 return []
         return []
 
+    async def suggest_related_interests(
+        self, seed_names: list[str], user_access_token: str, limit: int = 50
+    ) -> list[dict]:
+        """Discover related interests from seed interest names via Meta's suggestion API."""
+        result = await self.call_tool(
+            "suggest_related_interests",
+            {"seed_interests_json": json.dumps(seed_names), "limit": limit},
+            user_access_token,
+        )
+        if isinstance(result, list):
+            return result
+        content = result.get("content", []) if isinstance(result, dict) else []
+        if content and isinstance(content, list):
+            text = content[0].get("text", "[]")
+            try:
+                parsed = json.loads(text)
+                return parsed if isinstance(parsed, list) else []
+            except (json.JSONDecodeError, TypeError):
+                return []
+        return []
+
+    async def browse_interest_categories(
+        self, ad_account_id: str, user_access_token: str, limit: int = 200
+    ) -> list[dict]:
+        """Browse Meta's full interest taxonomy tree."""
+        result = await self.call_tool(
+            "browse_interest_categories",
+            {"ad_account_id": ad_account_id, "limit": limit},
+            user_access_token,
+        )
+        if isinstance(result, list):
+            return result
+        content = result.get("content", []) if isinstance(result, dict) else []
+        if content and isinstance(content, list):
+            text = content[0].get("text", "[]")
+            try:
+                parsed = json.loads(text)
+                return parsed if isinstance(parsed, list) else []
+            except (json.JSONDecodeError, TypeError):
+                return []
+        return []
+
+    async def search_geo_cities(
+        self, query: str, country_code: str, user_access_token: str
+    ) -> list:
+        """Search Meta geo cities for autocomplete."""
+        result = await self.call_tool(
+            "search_geo_cities",
+            {"query": query, "country_code": country_code},
+            user_access_token,
+        )
+        try:
+            content = result.get("content", []) if isinstance(result, dict) else []
+            text = content[0].get("text", "[]") if content else "[]"
+            return json.loads(text)
+        except (json.JSONDecodeError, TypeError, IndexError):
+            return []
+
     async def resolve_geo(
         self, cities: list[str], country_code: str, user_access_token: str
     ) -> dict:
@@ -452,6 +557,16 @@ class MCPClient:
         return await self.call_tool(
             "fetch_social_identities",
             {"ad_account_id": ad_account_id},
+            user_access_token,
+        )
+
+    async def check_page_whatsapp(
+        self, page_id: str, user_access_token: str
+    ) -> dict:
+        """Check if a Page has a connected WhatsApp number for native CTWA ads."""
+        return await self.call_tool(
+            "check_page_whatsapp",
+            {"page_id": page_id},
             user_access_token,
         )
 
@@ -555,8 +670,15 @@ class MCPClient:
         exclude_publisher_platforms: list[str] | None = None,
         bid_strategy: str | None = None,
         bid_amount: int | None = None,
+        age_min: int | None = None,
+        age_max: int | None = None,
+        genders: list[int] | None = None,
+        publisher_platforms: list[str] | None = None,
+        facebook_positions: list[str] | None = None,
+        instagram_positions: list[str] | None = None,
+        enable_advantage_audience: bool | None = None,
     ) -> dict:
-        """Update adset targeting (exclude placements) or bid strategy."""
+        """Update adset targeting (demographics, placements, audience expansion) or bid strategy."""
         args: dict[str, Any] = {"adset_id": adset_id}
         if exclude_publisher_platforms:
             args["exclude_publisher_platforms"] = exclude_publisher_platforms
@@ -564,6 +686,20 @@ class MCPClient:
             args["bid_strategy"] = bid_strategy
         if bid_amount is not None:
             args["bid_amount"] = bid_amount
+        if age_min is not None:
+            args["age_min"] = age_min
+        if age_max is not None:
+            args["age_max"] = age_max
+        if genders is not None:
+            args["genders"] = genders
+        if publisher_platforms is not None:
+            args["publisher_platforms"] = publisher_platforms
+        if facebook_positions is not None:
+            args["facebook_positions"] = facebook_positions
+        if instagram_positions is not None:
+            args["instagram_positions"] = instagram_positions
+        if enable_advantage_audience is not None:
+            args["enable_advantage_audience"] = enable_advantage_audience
         return await self.call_tool("update_adset_targeting", args, user_access_token)
 
     # ------------------------------------------------------------------
@@ -605,6 +741,91 @@ class MCPClient:
             "campaign_id": campaign_id,
             "country_code": country_code,
             "ratio": ratio,
+        }, user_access_token)
+
+    async def get_pixel_events(
+        self, pixel_id: str, user_access_token: str, days: int = 30,
+    ) -> dict:
+        """Fetch conversion events recorded by a Meta Pixel (default last 30 days)."""
+        return await self.call_tool(
+            "get_pixel_events",
+            {"pixel_id": pixel_id, "days": days},
+            user_access_token,
+        )
+
+    async def list_leadgen_forms(
+        self, user_access_token: str,
+        page_id: str = "", ad_account_id: str = "",
+    ) -> dict:
+        """List Lead Gen Forms — tries ad account first, falls back to page."""
+        args: dict = {}
+        if page_id:
+            args["page_id"] = page_id
+        if ad_account_id:
+            args["ad_account_id"] = ad_account_id
+        return await self.call_tool("list_leadgen_forms", args, user_access_token)
+
+    async def get_leadgen_leads(
+        self, form_id: str, user_access_token: str, limit: int = 500,
+    ) -> dict:
+        """Fetch leads submitted to a Meta Lead Gen Form."""
+        return await self.call_tool(
+            "get_leadgen_leads",
+            {"form_id": form_id, "limit": limit},
+            user_access_token,
+        )
+
+    async def create_website_custom_audience(
+        self, ad_account_id: str, pixel_id: str, name: str,
+        user_access_token: str,
+        retention_days: int = 14,
+        event_name: str = "PageView",
+    ) -> dict:
+        """Create a Website Custom Audience from pixel events for retargeting."""
+        return await self.call_tool(
+            "create_website_custom_audience",
+            {
+                "ad_account_id": ad_account_id,
+                "pixel_id": pixel_id,
+                "name": name,
+                "retention_days": retention_days,
+                "event_name": event_name,
+            },
+            user_access_token,
+        )
+
+    async def create_exclusion_audience(
+        self, ad_account_id: str, pixel_id: str, name: str,
+        user_access_token: str,
+        event_name: str = "CompleteRegistration",
+        retention_days: int = 180,
+    ) -> dict:
+        """Create a Website Custom Audience for exclusion (already-converted users)."""
+        return await self.call_tool(
+            "create_exclusion_audience",
+            {
+                "ad_account_id": ad_account_id,
+                "pixel_id": pixel_id,
+                "name": name,
+                "event_name": event_name,
+                "retention_days": retention_days,
+            },
+            user_access_token,
+        )
+
+    async def create_engagement_custom_audience(
+        self, ad_account_id: str, name: str, page_id: str,
+        user_access_token: str,
+        retention_days: int = 365,
+        engagement_type: str = "PAGE_ENGAGEMENT",
+    ) -> dict:
+        """Create Engagement Custom Audience from FB/IG page interactions."""
+        return await self.call_tool("create_engagement_custom_audience", {
+            "ad_account_id": ad_account_id,
+            "name": name,
+            "page_id": page_id,
+            "retention_days": retention_days,
+            "engagement_type": engagement_type,
         }, user_access_token)
 
 

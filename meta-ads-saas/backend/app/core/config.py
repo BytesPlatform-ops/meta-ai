@@ -44,6 +44,9 @@ class Settings(BaseSettings):
     SMTP_PASSWORD: str = ""
     SMTP_FROM: str = "noreply@metaadsai.com"
 
+    # Webhook
+    WEBHOOK_SECRET: str = ""  # shared secret for /webhooks/customer-sync
+
     # CORS
     ALLOWED_ORIGINS: list[str] = ["http://localhost:54561"]
 

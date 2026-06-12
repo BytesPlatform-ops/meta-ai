@@ -4,7 +4,8 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { createClient } from "@/lib/supabase/client";
 import { useRouter } from "next/navigation";
-import { BarChart3, LayoutGrid, TrendingUp, Package, Settings, LogOut, FileCheck, Zap, Sparkles } from "lucide-react";
+import { BarChart3, LayoutGrid, TrendingUp, Package, Settings, LogOut, FileCheck, Zap, Sparkles, Users, ClipboardList, Briefcase, Crosshair } from "lucide-react";
+import { WorkspaceSwitcher } from "./WorkspaceSwitcher";
 
 const NAV = [
   { label: "Dashboard", href: "/dashboard", icon: LayoutGrid },
@@ -13,7 +14,11 @@ const NAV = [
   { label: "Analytics", href: "/dashboard/analytics", icon: BarChart3 },
   { label: "Co-Pilot", href: "/dashboard/copilot", icon: Sparkles },
   { label: "Products", href: "/dashboard/products", icon: Package },
+  { label: "Hiring", href: "/dashboard/hiring", icon: Briefcase },
+  { label: "Audiences", href: "/dashboard/audiences", icon: Users },
+  { label: "Leads", href: "/dashboard/leads", icon: ClipboardList },
   { label: "Rules", href: "/dashboard/rules", icon: Zap },
+  { label: "Pixels", href: "/dashboard/pixels", icon: Crosshair },
   { label: "Settings", href: "/dashboard/settings", icon: Settings },
 ];
 
@@ -37,6 +42,11 @@ export function Sidebar({ email }: { email: string }) {
           </div>
           <span className="font-bold text-white text-sm tracking-tight">Meta Ads AI</span>
         </Link>
+      </div>
+
+      {/* Workspace Switcher */}
+      <div className="px-3 py-2 border-b border-white/[0.06]">
+        <WorkspaceSwitcher />
       </div>
 
       {/* Nav */}

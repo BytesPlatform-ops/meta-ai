@@ -9,7 +9,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from .core.config import get_settings
-from .api.routes import oauth, campaigns, products, preferences, drafts, generate, audits, uploads, rules, pixels, strategy, audiences, manual_connect, optimize, lead_forms
+from .api.routes import oauth, campaigns, products, preferences, drafts, generate, audits, uploads, rules, pixels, strategy, audiences, manual_connect, optimize, lead_forms, workspaces, hiring
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -106,6 +106,8 @@ app.include_router(audiences.router, prefix=API_PREFIX)
 app.include_router(manual_connect.router, prefix=API_PREFIX)
 app.include_router(optimize.router, prefix=API_PREFIX)
 app.include_router(lead_forms.router, prefix=API_PREFIX)
+app.include_router(workspaces.router, prefix=API_PREFIX)
+app.include_router(hiring.router, prefix=API_PREFIX)
 
 
 @app.get("/health")

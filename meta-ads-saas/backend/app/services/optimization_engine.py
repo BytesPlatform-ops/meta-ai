@@ -110,7 +110,7 @@ def _get_product_performance(user_id: str, campaigns_text: str) -> str:
 
 # ── Main Pipeline ─────────────────────────────────────────────────────────────
 
-async def run_optimization(user_id: str, ad_account_id: str | None = None) -> list[dict]:
+async def run_optimization(user_id: str, ad_account_id: str | None = None, workspace_id: str | None = None) -> list[dict]:
     """
     Full optimization pipeline for a single user:
       1. Resolve ad account + access token
@@ -129,6 +129,8 @@ async def run_optimization(user_id: str, ad_account_id: str | None = None) -> li
         .eq("user_id", user_id)
         .eq("is_active", True)
     )
+    if workspace_id:
+        query = query.eq("workspace_id", workspace_id)
     if ad_account_id:
         query = query.eq("id", ad_account_id)
     result = query.limit(1).execute()

@@ -1,0 +1,51 @@
+CAMPAIGN OVERVIEW
+======================================================================================================
+| Metric                | Web New Video WA (27/02) | Website WA Lead (12/02) | Ecomm BytesCart (07/03) | Web 20min Video (26/02) |
+|-----------------------|--------------------------|-------------------------|-------------------------|-------------------------|
+| Product               | $99 Basic Website        | $99 Basic Website       | BytesCart                | BytesInfo              |
+| Creative              | Video                    | Image                   | Image                   | Video                   |
+| Destination           | WhatsApp                 | WhatsApp                | Registration Form       | Registration Form       |
+| Budget/day            | $35                      | $30                     | $20                     | $35                     |
+| Total Spend           | $978.72                  | $621.00                 | $460.44                 | $988.30                 |
+| Days Running          | 28d                      | 43d                     | 20d                     | 30d                     |
+| Impressions           | 18,630                   | 4,554                   | 8,868                   | 8,327                   |
+| Reach                 | 11,465                   | 3,450                   | 5,874                   | 4,856                   |
+| Clicks                | 259                      | 175                     | 335                     | 302                     |
+| CTR                   | 1.39%                    | 3.84%                   | 3.78%                   | 3.63%                   |
+| CPC                   | $3.78                    | $3.55                   | $1.37                   | $3.27                   |
+| CPM                   | $52.53                   | $136.36                 | $51.92                  | $118.69                 |
+| Frequency             | 1.62                     | 1.32                    | 1.51                    | 1.71                    |
+| Result Type           | WA Conversations         | Form Leads              | Registrations           | Form Leads              |
+| Results               | 46 convos (51 connects)  | 37 leads                | 48 registrations        | 32 leads                |
+| CPL / CPR             | $21.28/convo             | $16.78/lead             | $9.59/reg               | $30.88/lead             |
+==================================================================================================================================
+
+PERFORMANCE VERDICT
+==================================================================================================================================
+
+1. Ecomm BytesCart — WINNER (registration form, image)
+   - Best CPL at $9.59 — cheapest by far
+   - Best CPC at $1.37 — people actually want to click
+   - Lowest CPM at $51.92 — Meta is finding cheap audience
+   - 48 registrations on only $460 spend in 20 days
+   - This is your best performing campaign. Scale this.
+
+2. Website WA Lead 12/02 — DECENT (WhatsApp form, image)
+   - $16.78/lead is solid for WhatsApp leads
+   - BUT CPM is absurdly high at $136 — Meta is over-paying for this audience
+   - Only 4,554 impressions on $621 spend means you're reaching very expensive people
+   - Currently paused — makes sense given the CPM problem
+
+3. Web New Video WA 27/02 — MEDIOCRE (WhatsApp, video)
+   - $21.28/convo is expensive for WhatsApp leads
+   - CTR is low at 1.39% (worst of all 4) — video hook isn't grabbing attention
+   - 46 conversations but only 18 went to depth-2 (39% drop-off) and only 3 to depth-5
+   - People aren't engaging deeply in WhatsApp after clicking
+   - Spending $35/day for mid results. Consider reducing budget or refreshing the video hook.
+
+4. Web 20min Video 26/02 — WORST (form, video)
+   - $30.88/lead — most expensive by 3x vs BytesCart
+   - CPM is $118.69 — Meta is over-charging
+   - 32 leads on $988 spend — nearly $1K for 32 leads
+   - Correctly paused. Don't unpause this.
+

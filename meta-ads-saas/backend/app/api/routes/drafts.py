@@ -11,9 +11,9 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, s
 from pydantic import BaseModel
 from typing import Optional
 
-from ...api.deps import get_current_user_id
+from ...api.deps import get_current_user_id, get_workspace_id
 from ...db.supabase_client import get_supabase
-from ...services.ad_executor import execute_approved_ad, execute_organic_post
+from ...services.ad_executor import execute_approved_ad, execute_organic_post, validate_ab_drafts, execute_ab_test
 from ...services.mcp_client import MCPClient
 
 router = APIRouter(prefix="/drafts", tags=["Content Drafts"])
@@ -38,13 +38,14 @@ class CreateDraftPayload(BaseModel):
 async def list_drafts(
     draft_status: Optional[str] = Query(None, alias="status"),
     user_id: str = Depends(get_current_user_id),
+    workspace_id: str = Depends(get_workspace_id),
 ):
-    """List drafts for the current user, optionally filtered by status."""
+    """List drafts for the current workspace, optionally filtered by status."""
     supabase = get_supabase()
     query = (
         supabase.table("content_drafts")
         .select("*")
-        .eq("user_id", user_id)
+        .eq("workspace_id", workspace_id)
         .order("created_at", desc=True)
     )
     if draft_status:
@@ -56,13 +57,17 @@ async def list_drafts(
 # ── Get single draft ──────────────────────────────────────────────────────────
 
 @router.get("/{draft_id}")
-async def get_draft(draft_id: str, user_id: str = Depends(get_current_user_id)):
+async def get_draft(
+    draft_id: str,
+    user_id: str = Depends(get_current_user_id),
+    workspace_id: str = Depends(get_workspace_id),
+):
     supabase = get_supabase()
     result = (
         supabase.table("content_drafts")
         .select("*")
         .eq("id", draft_id)
-        .eq("user_id", user_id)
+        .eq("workspace_id", workspace_id)
         .execute()
     )
     if not result.data:
@@ -76,10 +81,12 @@ async def get_draft(draft_id: str, user_id: str = Depends(get_current_user_id)):
 async def create_draft(
     payload: CreateDraftPayload,
     user_id: str = Depends(get_current_user_id),
+    workspace_id: str = Depends(get_workspace_id),
 ):
     supabase = get_supabase()
     data = {
         "user_id": user_id,
+        "workspace_id": workspace_id,
         "draft_type": payload.draft_type,
         "headline": payload.headline,
         "body_text": payload.body_text,
@@ -116,6 +123,25 @@ class UpdateDraftPayload(BaseModel):
     lead_form_id: Optional[str] = None
     selected_messaging_apps: Optional[list] = None
     call_phone_number: Optional[str] = None
+    # Per-draft destination URL override — used when the user wants the ad to
+    # link to a specific page (e.g. /onboarding/sign-up?tab=signup) instead of
+    # the workspace/product default. Empty string clears the override.
+    destination_url: Optional[str] = None
+    # Multi-country support: comma-separated country codes (e.g. "US,GB").
+    # Highest-priority geo signal — overrides workspace + product + targeting JSON.
+    target_country: Optional[str] = None
+    # Explicit campaign-level objective override. When set (e.g. "OUTCOME_LEADS"),
+    # ad_executor uses this verbatim instead of inferring from destination_type.
+    # Without this declaration, Pydantic silently drops the UI's selection.
+    campaign_objective: Optional[str] = None
+    # Carousel toggle. When true and the draft has 2+ media_items, the publish
+    # pipeline builds ONE carousel ad (swipeable child_attachments) instead of
+    # N separate A/B ads.
+    is_carousel: Optional[bool] = None
+    # Retry-from-failed support: client may set status="pending" + error_message=null
+    # to recover a failed draft after attaching a missing creative. Validated below.
+    status: Optional[str] = None
+    error_message: Optional[str] = None
 
 
 @router.patch("/{draft_id}")
@@ -123,6 +149,7 @@ async def update_draft(
     draft_id: str,
     payload: UpdateDraftPayload,
     user_id: str = Depends(get_current_user_id),
+    workspace_id: str = Depends(get_workspace_id),
 ):
     """Update a pending draft — edit any field before approving."""
     supabase = get_supabase()
@@ -130,19 +157,44 @@ async def update_draft(
         supabase.table("content_drafts")
         .select("id, status")
         .eq("id", draft_id)
-        .eq("user_id", user_id)
+        .eq("workspace_id", workspace_id)
         .execute()
     )
     if not existing.data:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Draft not found")
-    if existing.data[0]["status"] != "pending":
-        raise HTTPException(status.HTTP_409_CONFLICT, "Only pending drafts can be updated")
+    current_status = existing.data[0]["status"]
+    if current_status not in ("pending", "failed"):
+        raise HTTPException(status.HTTP_409_CONFLICT, "Only pending or failed drafts can be updated")
 
     updates = {}
-    for field in ("headline", "body_text", "image_url", "cta_type", "proposed_budget", "draft_type", "targeting", "pixel_id", "conversion_event", "thumbnail_url", "destination_type", "whatsapp_number", "media_items", "lead_form_id", "selected_messaging_apps", "call_phone_number"):
+    for field in ("headline", "body_text", "image_url", "cta_type", "proposed_budget", "draft_type", "targeting", "pixel_id", "conversion_event", "thumbnail_url", "destination_type", "whatsapp_number", "media_items", "lead_form_id", "selected_messaging_apps", "call_phone_number", "target_country", "destination_url", "campaign_objective", "is_carousel"):
         val = getattr(payload, field)
         if val is not None:
             updates[field] = val
+    # Allow explicit clearing of target_country / destination_url (None vs not-supplied)
+    if payload.target_country is None and "target_country" in payload.model_fields_set:
+        updates["target_country"] = None
+    if payload.destination_url is None and "destination_url" in payload.model_fields_set:
+        updates["destination_url"] = None
+
+    # Allow recovering a failed draft by transitioning it back to pending. The only
+    # status transition accepted via this endpoint is failed → pending; anything else
+    # would let users force drafts into approved/active without going through the
+    # publish pipeline.
+    if payload.status is not None:
+        if current_status == "failed" and payload.status == "pending":
+            updates["status"] = "pending"
+            updates["error_message"] = None  # always clear stale error on recovery
+        elif payload.status == current_status:
+            pass  # no-op
+        else:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                f"Status transition {current_status} → {payload.status} not allowed via this endpoint",
+            )
+    elif payload.error_message is None and "error_message" in payload.model_fields_set:
+        # Client explicitly cleared error_message without changing status
+        updates["error_message"] = None
 
     if not updates:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "No fields to update")
@@ -151,7 +203,7 @@ async def update_draft(
         supabase.table("content_drafts")
         .update(updates)
         .eq("id", draft_id)
-        .eq("user_id", user_id)
+        .eq("workspace_id", workspace_id)
         .execute()
     )
     return result.data[0] if result.data else {"id": draft_id, **updates}
@@ -164,6 +216,7 @@ async def approve_draft(
     draft_id: str,
     background_tasks: BackgroundTasks,
     user_id: str = Depends(get_current_user_id),
+    workspace_id: str = Depends(get_workspace_id),
 ):
     """
     Mark a draft as approved.
@@ -177,7 +230,7 @@ async def approve_draft(
         supabase.table("content_drafts")
         .select("id, status, draft_type")
         .eq("id", draft_id)
-        .eq("user_id", user_id)
+        .eq("workspace_id", workspace_id)
         .execute()
     )
     if not existing.data:
@@ -189,7 +242,7 @@ async def approve_draft(
         supabase.table("content_drafts")
         .update({"status": "approved"})
         .eq("id", draft_id)
-        .eq("user_id", user_id)
+        .eq("workspace_id", workspace_id)
         .execute()
     )
 
@@ -207,10 +260,66 @@ async def approve_draft(
     }
 
 
+# ── A/B Test Launch ──────────────────────────────────────────────────────────
+
+class LaunchAbBody(BaseModel):
+    draft_ids: list[str]
+
+
+@router.post("/launch-ab")
+async def launch_ab_test(
+    body: LaunchAbBody,
+    background_tasks: BackgroundTasks,
+    user_id: str = Depends(get_current_user_id),
+    workspace_id: str = Depends(get_workspace_id),
+):
+    """
+    Launch multiple drafts as an A/B test under a single Campaign + Ad Set.
+    All drafts must share the same product_id and destination_type.
+    """
+    if len(body.draft_ids) < 2:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "A/B test requires at least 2 drafts")
+
+    supabase = get_supabase()
+
+    # Load all drafts and verify ownership
+    drafts = []
+    for did in body.draft_ids:
+        result = (
+            supabase.table("content_drafts")
+            .select("*")
+            .eq("id", did)
+            .eq("workspace_id", workspace_id)
+            .execute()
+        )
+        if not result.data:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, f"Draft {did} not found")
+        drafts.append(result.data[0])
+
+    # Validate compatibility
+    error = validate_ab_drafts(drafts)
+    if error:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, error)
+
+    # Execute in background
+    background_tasks.add_task(execute_ab_test, body.draft_ids)
+
+    return {
+        "draft_ids": body.draft_ids,
+        "draft_count": len(body.draft_ids),
+        "execution_triggered": True,
+        "message": f"A/B test with {len(body.draft_ids)} variants is being launched",
+    }
+
+
 # ── Reject / Regenerate ──────────────────────────────────────────────────────
 
 @router.patch("/{draft_id}/reject")
-async def reject_draft(draft_id: str, user_id: str = Depends(get_current_user_id)):
+async def reject_draft(
+    draft_id: str,
+    user_id: str = Depends(get_current_user_id),
+    workspace_id: str = Depends(get_workspace_id),
+):
     """Reject a draft — marks it for regeneration."""
     supabase = get_supabase()
 
@@ -218,7 +327,7 @@ async def reject_draft(draft_id: str, user_id: str = Depends(get_current_user_id
         supabase.table("content_drafts")
         .select("id, status")
         .eq("id", draft_id)
-        .eq("user_id", user_id)
+        .eq("workspace_id", workspace_id)
         .execute()
     )
     if not existing.data:
@@ -230,7 +339,7 @@ async def reject_draft(draft_id: str, user_id: str = Depends(get_current_user_id
         supabase.table("content_drafts")
         .update({"status": "rejected"})
         .eq("id", draft_id)
-        .eq("user_id", user_id)
+        .eq("workspace_id", workspace_id)
         .execute()
     )
     return result.data[0] if result.data else {"id": draft_id, "status": "rejected"}
@@ -239,7 +348,11 @@ async def reject_draft(draft_id: str, user_id: str = Depends(get_current_user_id
 # ── Pause & Reset to Pending ─────────────────────────────────────────────────
 
 @router.patch("/{draft_id}/pause")
-async def pause_draft(draft_id: str, user_id: str = Depends(get_current_user_id)):
+async def pause_draft(
+    draft_id: str,
+    user_id: str = Depends(get_current_user_id),
+    workspace_id: str = Depends(get_workspace_id),
+):
     """Pause a live ad on Meta and reset the draft back to pending for editing."""
     supabase = get_supabase()
 
@@ -247,7 +360,7 @@ async def pause_draft(draft_id: str, user_id: str = Depends(get_current_user_id)
         supabase.table("content_drafts")
         .select("id, status, meta_ad_id, ad_account_id, user_id")
         .eq("id", draft_id)
-        .eq("user_id", user_id)
+        .eq("workspace_id", workspace_id)
         .execute()
     )
     if not existing.data:
@@ -264,6 +377,7 @@ async def pause_draft(draft_id: str, user_id: str = Depends(get_current_user_id)
             .select("access_token")
             .eq("ad_account_id", draft["ad_account_id"])
             .eq("user_id", user_id)
+            .eq("workspace_id", workspace_id)
             .execute()
         )
         if token_row.data:
@@ -277,7 +391,7 @@ async def pause_draft(draft_id: str, user_id: str = Depends(get_current_user_id)
         supabase.table("content_drafts")
         .update({"status": "pending"})
         .eq("id", draft_id)
-        .eq("user_id", user_id)
+        .eq("workspace_id", workspace_id)
         .execute()
     )
     return result.data[0] if result.data else {"id": draft_id, "status": "pending"}

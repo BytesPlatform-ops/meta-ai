@@ -1,7 +1,8 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useCallback } from "react";
 import { Loader2 } from "lucide-react";
+import { useAutoRefresh } from "@/hooks/useAutoRefresh";
 import DateRangePicker, { type DateRangeValue } from "@/components/DateRangePicker";
 import {
   LineChart,
@@ -47,6 +48,7 @@ function GlassCard({ children, className = "" }: { children: React.ReactNode; cl
 
 const RESULT_LABELS: Record<string, { label: string; costLabel: string; isCost: boolean }> = {
   purchases: { label: "Purchases", costLabel: "ROAS", isCost: false },
+  registrations: { label: "Registrations", costLabel: "Cost/Reg", isCost: true },
   leads: { label: "Leads", costLabel: "CPL", isCost: true },
   messaging_conversations: { label: "Chats", costLabel: "Cost/Chat", isCost: true },
   messaging_replies: { label: "Replies", costLabel: "Cost/Reply", isCost: true },
@@ -65,7 +67,7 @@ type CampaignRow = { id: string; name: string; spend: number; roas: number | nul
 type TimeSeriesData = { daily: DailyRow[]; by_campaign?: CampaignRow[] };
 
 export default function AnalyticsPage() {
-  const [datePreset, setDatePreset] = useState<string>("last_7d");
+  const [datePreset, setDatePreset] = useState<string>("maximum");
   const [since, setSince] = useState<string | undefined>();
   const [until, setUntil] = useState<string | undefined>();
   const [data, setData] = useState<TimeSeriesData | null>(null);
@@ -103,6 +105,22 @@ export default function AnalyticsPage() {
     });
     return () => { cancelled = true; };
   }, [datePreset, since, until]);
+
+  const refreshAnalytics = useCallback(() => {
+    const cacheKey = `analytics_${datePreset}_${since}_${until}`;
+    try { sessionStorage.removeItem(cacheKey); } catch { /* ignore */ }
+    api.getDefaultTimeSeries(datePreset, since, until).then((res: { data: TimeSeriesData }) => {
+      const tsData = (res as { data: TimeSeriesData }).data ?? res;
+      if (tsData?.daily) {
+        tsData.daily = tsData.daily.map((d: DailyRowRaw & { cost_per_result?: number }) => ({
+          ...d,
+          cost_per_result: d.cost_per_result ?? (d.results > 0 ? Math.round(d.spend / d.results) : 0),
+        }));
+      }
+      setData(tsData);
+    }).catch(() => { /* ignore */ });
+  }, [datePreset, since, until]);
+  useAutoRefresh(refreshAnalytics);
 
   const topCampaigns = (data?.by_campaign
     ?.slice()

@@ -420,6 +420,14 @@ function DraftDetailModal({
   );
   const [showProfitTooltip, setShowProfitTooltip] = useState(false);
 
+  // Geo targeting state — draft-level override
+  const specForGeo = parseTargetingSpec(draft.targeting_spec);
+  const initialCountry = (draft.targeting as Record<string, string>)?.target_country
+    || specForGeo?.target_country || draft.target_country || "";
+  const initialCities = ((draft.targeting as Record<string, unknown>)?.target_cities as string[] ?? []).join(", ");
+  const [editCountry, setEditCountry] = useState(initialCountry);
+  const [editCities, setEditCities] = useState(initialCities);
+
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -455,6 +463,17 @@ function DraftDetailModal({
         placements: draftPlacement,
         budget_currency: budgetCurrency,
         ...(parsedMargin ? { profit_margin: parsedMargin } : { profit_margin: null }),
+      };
+    }
+    // Geo targeting overrides
+    const citiesArr = editCities.split(",").map(c => c.trim()).filter(Boolean);
+    if (editCountry !== initialCountry || editCities !== initialCities) {
+      fields.targeting = {
+        ...((fields.targeting as Record<string, unknown>) || existingTargeting),
+        placements: (fields.targeting as Record<string, unknown>)?.placements ?? draftPlacement,
+        budget_currency: (fields.targeting as Record<string, unknown>)?.budget_currency ?? budgetCurrency,
+        ...(editCountry ? { target_country: editCountry } : {}),
+        target_cities: citiesArr.length > 0 ? citiesArr : null,
       };
     }
     if (Object.keys(fields).length > 0) {
@@ -643,13 +662,41 @@ function DraftDetailModal({
                   )}
                 </div>
               )}
+              {/* Geo Targeting Override */}
+              {draft.draft_type === "paid" && (
+                <div className="bg-blue-500/[0.04] border border-blue-500/10 rounded-xl px-4 py-4 space-y-3">
+                  <div className="flex items-center gap-2">
+                    <Target className="w-4 h-4 text-blue-400" />
+                    <p className="text-[10px] font-semibold uppercase tracking-wider text-blue-400">Geo Targeting (Override)</p>
+                  </div>
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label className="text-xs text-gray-500 mb-1.5 block">Target Country</label>
+                      <select value={editCountry} onChange={(e) => setEditCountry(e.target.value)}
+                        className="w-full px-3 py-2.5 rounded-xl bg-white/[0.04] border border-white/[0.08] text-white text-sm focus:outline-none focus:border-violet-500/40 transition-all">
+                        <option value="">Use default</option>
+                        {Object.entries(COUNTRY_NAMES).map(([code, name]) => (
+                          <option key={code} value={code}>{name}</option>
+                        ))}
+                      </select>
+                    </div>
+                    <div>
+                      <label className="text-xs text-gray-500 mb-1.5 block">Target Cities (optional)</label>
+                      <input type="text" value={editCities} onChange={(e) => setEditCities(e.target.value)}
+                        placeholder="e.g. Lahore, Karachi, Islamabad"
+                        className="w-full px-3 py-2.5 rounded-xl bg-white/[0.04] border border-white/[0.08] text-white text-sm placeholder-gray-600 focus:outline-none focus:border-violet-500/40 transition-all" />
+                    </div>
+                  </div>
+                  <p className="text-[10px] text-gray-500">Leave cities blank to target the entire country. Separate cities with commas.</p>
+                </div>
+              )}
               <div className="flex gap-2 pt-1">
                 <button onClick={handleSaveEdits} disabled={saving}
                   className="flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-semibold bg-gradient-to-r from-violet-600 to-blue-600 hover:from-violet-500 hover:to-blue-500 text-white transition-all disabled:opacity-50">
                   {saving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <CheckCircle2 className="w-3.5 h-3.5" />}
                   Save Changes
                 </button>
-                <button onClick={() => { setEditing(false); setHeadline(draft.headline ?? ""); setBodyText(draft.body_text); setCtaType(draft.cta_type ?? "SHOP_NOW"); setBudget(String(draft.proposed_budget ?? "")); }}
+                <button onClick={() => { setEditing(false); setHeadline(draft.headline ?? ""); setBodyText(draft.body_text); setCtaType(draft.cta_type ?? "SHOP_NOW"); setBudget(String(draft.proposed_budget ?? "")); setEditCountry(initialCountry); setEditCities(initialCities); }}
                   className="px-4 py-2.5 rounded-xl text-sm text-gray-400 hover:text-white bg-white/[0.03] border border-white/[0.06] transition-all">
                   Cancel
                 </button>
@@ -704,7 +751,9 @@ function DraftDetailModal({
               {/* Geo-Cultural Targeting Spec (Detail View) */}
               {draft.draft_type === "paid" && (() => {
                 const spec = parseTargetingSpec(draft.targeting_spec);
-                const country = spec?.target_country || draft.target_country;
+                const draftTgt = (draft.targeting || {}) as Record<string, unknown>;
+                const country = (draftTgt.target_country as string) || spec?.target_country || draft.target_country;
+                const cities = (draftTgt.target_cities as string[]) || [];
                 const interests = spec?.validated_interests;
                 if (!country && !interests?.length) return null;
                 return (
@@ -713,6 +762,7 @@ function DraftDetailModal({
                       <Target className="w-4 h-4 text-blue-400" />
                       <p className="text-[10px] font-semibold uppercase tracking-wider text-blue-400">
                         Geo-Cultural Targeting: {country ? COUNTRY_NAMES[country] || country : ""}
+                        {cities.length > 0 && ` — ${cities.join(", ")}`}
                       </p>
                     </div>
                     {interests && interests.length > 0 && (
@@ -1038,7 +1088,9 @@ function DraftCard({
         {/* Geo-Cultural Targeting */}
         {draft.draft_type === "paid" && (() => {
           const spec = parseTargetingSpec(draft.targeting_spec);
-          const country = spec?.target_country || draft.target_country;
+          const cardTgt = (draft.targeting || {}) as Record<string, unknown>;
+          const country = (cardTgt.target_country as string) || spec?.target_country || draft.target_country;
+          const cardCities = (cardTgt.target_cities as string[]) || [];
           const interests = spec?.validated_interests;
           if (!country && !interests?.length) return null;
           return (
@@ -1046,7 +1098,7 @@ function DraftCard({
               <Target className="w-3.5 h-3.5 text-blue-400 mt-0.5 shrink-0" />
               <div className="min-w-0">
                 <p className="text-[10px] font-semibold uppercase tracking-wider text-blue-400 mb-1">
-                  Targeting: {country ? COUNTRY_NAMES[country] || country : ""}
+                  Targeting: {country ? COUNTRY_NAMES[country] || country : ""}{cardCities.length > 0 && ` — ${cardCities.join(", ")}`}
                 </p>
                 {interests && interests.length > 0 && (
                   <div className="flex flex-wrap gap-1">

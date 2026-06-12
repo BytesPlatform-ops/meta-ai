@@ -9,7 +9,7 @@ import logging
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 
-from ...api.deps import get_current_user_id
+from ...api.deps import get_current_user_id, get_workspace_id
 from ...db.supabase_client import get_supabase
 from ...services.strategy_engine import generate_content_strategy
 
@@ -22,6 +22,7 @@ router = APIRouter(prefix="/strategy", tags=["Content Strategy"])
 async def trigger_strategy_generation(
     background_tasks: BackgroundTasks,
     user_id: str = Depends(get_current_user_id),
+    workspace_id: str = Depends(get_workspace_id),
 ):
     """Kick off the autonomous market research + strategy pipeline."""
 
@@ -39,13 +40,16 @@ async def trigger_strategy_generation(
 
 
 @router.get("")
-async def get_latest_strategy(user_id: str = Depends(get_current_user_id)):
+async def get_latest_strategy(
+    user_id: str = Depends(get_current_user_id),
+    workspace_id: str = Depends(get_workspace_id),
+):
     """Return the most recent content strategy for this user."""
     supabase = get_supabase()
     result = (
         supabase.table("content_strategies")
         .select("*")
-        .eq("user_id", user_id)
+        .eq("workspace_id", workspace_id)
         .order("created_at", desc=True)
         .limit(1)
         .execute()
@@ -56,13 +60,16 @@ async def get_latest_strategy(user_id: str = Depends(get_current_user_id)):
 
 
 @router.get("/history")
-async def list_strategies(user_id: str = Depends(get_current_user_id)):
+async def list_strategies(
+    user_id: str = Depends(get_current_user_id),
+    workspace_id: str = Depends(get_workspace_id),
+):
     """Return all strategies for this user, newest first."""
     supabase = get_supabase()
     result = (
         supabase.table("content_strategies")
         .select("id, niche, research_summary, status, created_at")
-        .eq("user_id", user_id)
+        .eq("workspace_id", workspace_id)
         .order("created_at", desc=True)
         .limit(20)
         .execute()
@@ -74,6 +81,7 @@ async def list_strategies(user_id: str = Depends(get_current_user_id)):
 async def approve_strategy(
     strategy_id: str,
     user_id: str = Depends(get_current_user_id),
+    workspace_id: str = Depends(get_workspace_id),
 ):
     """Mark a strategy as APPROVED."""
     supabase = get_supabase()
@@ -81,7 +89,7 @@ async def approve_strategy(
         supabase.table("content_strategies")
         .select("id")
         .eq("id", strategy_id)
-        .eq("user_id", user_id)
+        .eq("workspace_id", workspace_id)
         .execute()
     )
     if not existing.data:

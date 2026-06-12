@@ -47,6 +47,9 @@ class AccountBaselines:
         self.dominant_type = dominant_type
         self.sample_size = sample_size
         self.target_cost_per_result = target_cost_per_result
+        self.per_type_baselines: dict[str, float] = {}  # result_type → avg cost_per_result
+        # Per-objective creative baselines: objective → {avg_ctr, avg_cpc, avg_cpm}
+        self.per_objective_creative: dict[str, dict[str, float]] = {}
         self.source = source  # "historical", "user_target", or "fallback"
 
     @property
@@ -111,7 +114,17 @@ class AccountBaselines:
             "source": self.source,
             "win_threshold": self.winning_threshold(),
             "lose_threshold": self.losing_threshold(),
+            "per_type_baselines": self.per_type_baselines,
+            "per_objective_creative": self.per_objective_creative,
         }
+
+
+# ── Baselines Cache (5-minute TTL to avoid Meta API rate limits) ──────────────
+
+import time as _time
+
+_baselines_cache: dict[str, tuple[float, AccountBaselines]] = {}
+_BASELINES_TTL = 300  # 5 minutes
 
 
 # ── Calculator ───────────────────────────────────────────────────────────────
@@ -124,7 +137,13 @@ async def calculate_account_baselines(
     """
     Query 30-day ad data via MCP and compute the account's unique baselines.
     Falls back to user-defined target_cost_per_result if no historical data.
+    Results cached for 5 minutes to avoid Meta API rate limits.
     """
+    cache_key = f"{ad_account_id}:{user_id or ''}"
+    cached = _baselines_cache.get(cache_key)
+    if cached and cached[0] > _time.monotonic():
+        return cached[1]
+
     try:
         mcp_result = await mcp_client.call_tool(
             "get_account_audit_data",
@@ -142,7 +161,9 @@ async def calculate_account_baselines(
         else:
             ad_data = mcp_result
 
-        ads: list[dict] = ad_data.get("ads", [])
+        all_ads: list[dict] = ad_data.get("ads", [])
+        # Include all ads that had spend in the period (active, paused, completed)
+        ads = [a for a in all_ads if a.get("spend", 0) > 0 or a.get("effective_status", "ACTIVE") == "ACTIVE"]
         if not ads:
             return _fallback_baselines(user_id)
 
@@ -152,6 +173,20 @@ async def calculate_account_baselines(
         total_leads = sum(a.get("leads", 0) for a in ads)
         total_purchases = sum(a.get("purchases", 0) for a in ads)
         dominant_type = ad_data.get("dominant_result_type", "purchases")
+
+        # Per-result-type baselines: group ads by result_type, compute avg cost_per_result per group
+        per_type_baselines: dict[str, float] = {}
+        type_groups: dict[str, list[dict]] = {}
+        for a in ads:
+            rt = a.get("result_type", "none")
+            if rt != "none" and a.get("results", 0) > 0 and a.get("spend", 0) > 0:
+                type_groups.setdefault(rt, []).append(a)
+        for rt, group in type_groups.items():
+            group_spend = sum(a["spend"] for a in group)
+            group_results = sum(a["results"] for a in group)
+            if group_results > 0:
+                per_type_baselines[rt] = round(group_spend / group_results, 2)
+        logger.info("Per-type baselines: %s", per_type_baselines)
 
         avg_cpl = round(total_spend / total_leads, 2) if total_leads > 0 else None
         avg_cpa = round(total_spend / total_purchases, 2) if total_purchases > 0 else None
@@ -170,6 +205,25 @@ async def calculate_account_baselines(
                         sum(a["roas"] * a["spend"] for a in roas_ads) / total_weighted_spend, 2
                     )
 
+        # Per-objective creative baselines: group by objective, compute CTR/CPC/CPM per group
+        per_objective_creative: dict[str, dict[str, float]] = {}
+        obj_groups: dict[str, list[dict]] = {}
+        for a in ads:
+            obj = a.get("objective", "") or ""
+            if obj and a.get("spend", 0) > 0:
+                obj_groups.setdefault(obj, []).append(a)
+        for obj, group in obj_groups.items():
+            g_spend = sum(a.get("spend", 0) for a in group)
+            g_impressions = sum(a.get("impressions", 0) for a in group)
+            g_clicks = sum(a.get("clicks", 0) for a in group)
+            if g_impressions > 0 and g_clicks > 0:
+                per_objective_creative[obj] = {
+                    "avg_ctr": round(g_clicks / g_impressions * 100, 2),
+                    "avg_cpc": round(g_spend / g_clicks, 2),
+                    "avg_cpm": round(g_spend / g_impressions * 1000, 2),
+                }
+        logger.info("Per-objective creative baselines: %s", per_objective_creative)
+
         baselines = AccountBaselines(
             avg_cpl=avg_cpl,
             avg_cpa=avg_cpa,
@@ -184,6 +238,8 @@ async def calculate_account_baselines(
             sample_size=len(ads),
             source="historical",
         )
+        baselines.per_type_baselines = per_type_baselines
+        baselines.per_objective_creative = per_objective_creative
 
         logger.info(
             f"Baselines for {ad_account_id}: "
@@ -191,6 +247,7 @@ async def calculate_account_baselines(
             f"CTR={avg_ctr}%, CPC=${avg_cpc}, CPM=${avg_cpm} "
             f"(from {len(ads)} ads, {dominant_type})"
         )
+        _baselines_cache[cache_key] = (_time.monotonic() + _BASELINES_TTL, baselines)
         return baselines
 
     except MCPError as e:
@@ -235,97 +292,243 @@ def _fallback_baselines(user_id: str | None) -> AccountBaselines:
     return AccountBaselines(source="fallback")
 
 
-# ── Evaluation helpers ───────────────────────────────────────────────────────
+# ── Multi-factor Ad Scoring (0-100) ──────────────────────────────────────────
+#
+# Score = Creative(40%) + Efficiency(35%) + Health(15%) + Maturity(10%)
+#
+# Creative:   CTR, CPC, CPM — universal across all objectives
+# Efficiency: cost_per_result vs per-type baseline, or ROAS for purchases
+# Health:     frequency (fatigue) + delivery consistency
+# Maturity:   spend + result count confidence
+#
+# Verdicts: Scale (75+), Hold (55-74), Underperforming (35-54), Kill (<35)
+# ─────────────────────────────────────────────────────────────────────────────
+
+import math
+
+
+def _sigmoid_score(value: float, baseline: float, invert: bool = False) -> float:
+    """Sigmoid percentile: 0.0-1.0. For cost metrics (lower=better), invert=True."""
+    if not baseline or baseline <= 0:
+        return 0.5  # no data → neutral
+    ratio = value / baseline
+    if invert:
+        ratio = 1.0 / ratio  # flip so higher = better
+    return max(0.0, min(1.0, 1 / (1 + math.exp(-3 * (ratio - 1)))))
+
 
 def evaluate_ad(
     ad: dict,
     baselines: AccountBaselines,
 ) -> dict:
     """
-    Evaluate a single ad against account baselines.
-    Returns the ad dict enriched with verdict, diagnostic context, and comparison data.
+    Multi-factor scoring: evaluate ad across creative quality, efficiency,
+    health, and maturity. Returns ad dict enriched with score (0-100),
+    verdict, and component breakdown.
     """
     spend = ad.get("spend", 0)
     results = ad.get("results", 0)
     result_type = ad.get("result_type", "none")
     ctr = float(ad.get("ctr", 0))
-    cpl = ad.get("cost_per_result")
+    cpc = float(ad.get("cpc", 0))
+    cpm = float(ad.get("cpm", 0))
+    frequency = float(ad.get("frequency", 1))
+    cost_per_result = ad.get("cost_per_result")
     roas = ad.get("roas")
+    days_running = ad.get("days_running") or 1
+    is_learning = ad.get("is_learning", False)
+    clicks = ad.get("clicks", 0)
+    impressions = ad.get("impressions", 0)
+    reach = ad.get("reach", 0)
+    if reach > 0 and impressions > 0:
+        frequency = max(frequency, impressions / reach)
 
-    # No results at all
-    if results == 0 and spend > 0:
-        verdict = "kill" if spend >= 2000 else "no_results"
-        return {
-            **ad,
-            "verdict": verdict,
-            "evaluation": _build_evaluation(ad, baselines, verdict),
-        }
+    # Compute CPC/CPM if not provided
+    if not cpc and clicks > 0:
+        cpc = round(spend / clicks, 2)
+    if not cpm and impressions > 0:
+        cpm = round(spend / impressions * 1000, 2)
 
-    # Determine primary metric comparison
-    if result_type == "leads" or baselines.dominant_type == "leads":
-        verdict = _evaluate_cost_metric(cpl, baselines, "cpl")
-    elif result_type == "purchases" or baselines.dominant_type == "purchases":
-        if roas is not None:
-            verdict = _evaluate_value_metric(roas, baselines, "roas")
+    # ── Component 1: Creative Score (0-40) — per-objective baselines when available ──
+    objective = ad.get("objective", "") or ""
+    obj_bl = baselines.per_objective_creative.get(objective, {})
+    bl_ctr = obj_bl.get("avg_ctr", baselines.avg_ctr)
+    bl_cpc = obj_bl.get("avg_cpc", baselines.avg_cpc)
+    bl_cpm = obj_bl.get("avg_cpm", baselines.avg_cpm)
+
+    ctr_s = _sigmoid_score(ctr, bl_ctr) * 20
+    cpc_s = _sigmoid_score(cpc, bl_cpc, invert=True) * 12 if cpc > 0 else 6
+    cpm_s = _sigmoid_score(cpm, bl_cpm, invert=True) * 8 if cpm > 0 else 4
+    creative = ctr_s + cpc_s + cpm_s
+
+    # Quality ranking bonus/penalty from Meta
+    qr = ad.get("quality_ranking")
+    if qr == "ABOVE_AVERAGE":
+        creative += 3
+    elif qr in ("BELOW_AVERAGE_10", "BELOW_AVERAGE_20"):
+        creative -= 3
+    elif qr == "BELOW_AVERAGE_35":
+        creative -= 5
+    creative = max(0, min(40, creative))
+
+    # ── Component 2: Efficiency Score (0-35) — per result type ────────────
+    if result_type == "purchases" and roas is not None and baselines.avg_roas:
+        efficiency = _sigmoid_score(roas, baselines.avg_roas) * 35
+    elif cost_per_result and cost_per_result > 0:
+        type_bl = baselines.per_type_baselines.get(result_type)
+        if not type_bl:
+            type_bl = baselines.avg_cpl or baselines.avg_cpa
+        if type_bl and type_bl > 0:
+            efficiency = _sigmoid_score(cost_per_result, type_bl, invert=True) * 35
         else:
-            verdict = _evaluate_cost_metric(cpl, baselines, "cpa")
+            efficiency = 17.5  # neutral — no baseline available
+    elif results == 0 and spend > 0:
+        # No results — partial credit based on CTR (creative proxy)
+        efficiency = _sigmoid_score(ctr, baselines.avg_ctr) * 10  # max 10/35
     else:
-        # Traffic / engagement — use CTR as primary
-        verdict = _evaluate_value_metric(ctr, baselines, "ctr")
+        efficiency = 17.5  # neutral
+
+    # ── Component 3: Health Score (0-15) — fatigue + delivery ─────────────
+    # Frequency: optimal 1-2, acceptable up to 3.4, bad above that
+    if frequency <= 2.0:
+        freq_s = 10
+    elif frequency <= 3.4:
+        freq_s = 10 - (frequency - 2.0) * 4
+    else:
+        freq_s = max(0, 4.4 - (frequency - 3.4) * 3)
+
+    # Delivery: is the ad actually spending meaningfully?
+    daily_spend = spend / max(days_running, 1)
+    if daily_spend >= 5:
+        delivery_s = 5
+    elif daily_spend >= 1:
+        delivery_s = 3
+    else:
+        delivery_s = 1
+    health = freq_s + delivery_s
+
+    # ── Component 4: Maturity (0-10) — confidence adjustment ─────────────
+    spend_conf = min(1.0, max(0.2, spend / 500))
+    result_conf = min(1.0, max(0.2 if results == 0 else 0.3, results / 50))
+    maturity = (spend_conf * 0.5 + result_conf * 0.5) * 10
+
+    # ── Final Score with maturity damping ─────────────────────────────────
+    raw = creative + efficiency + health + maturity
+    if maturity < 5:
+        # Pull immature ads toward neutral (50) to avoid premature verdicts
+        damping = maturity / 10
+        final = 50 + (raw - 50) * damping
+    else:
+        final = raw
+
+    score = max(0, min(100, round(final)))
+
+    # ── Verdict ──────────────────────────────────────────────────────────
+    if is_learning and results < 50 and days_running < 7:
+        verdict = "learning"
+    elif results == 0 and spend >= 200:
+        verdict = "kill"
+    elif results == 0 and spend > 0 and days_running < 7:
+        verdict = "learning"
+    elif score >= 75:
+        verdict = "scale"
+    elif score >= 55:
+        verdict = "hold"
+    elif score >= 35:
+        verdict = "underperforming"
+    else:
+        verdict = "kill"
+
+    components = {
+        "creative": round(creative, 1),
+        "efficiency": round(efficiency, 1),
+        "health": round(health, 1),
+        "maturity": round(maturity, 1),
+    }
+
+    diagnosis = diagnose_ad(ad, baselines, verdict)
 
     return {
         **ad,
+        "score": score,
         "verdict": verdict,
-        "evaluation": _build_evaluation(ad, baselines, verdict),
+        "diagnosis": diagnosis,
+        "components": components,
+        "evaluation": _build_evaluation(ad, baselines, verdict, score, components),
     }
 
 
-def _evaluate_cost_metric(
-    value: float | None,
-    baselines: AccountBaselines,
-    metric: str,
-) -> str:
-    """Evaluate a cost metric (lower is better): CPL, CPA, CPC."""
-    if value is None or value <= 0:
-        return "no_data"
+def diagnose_ad(ad: dict, baselines: AccountBaselines, verdict: str = "") -> str:
+    """Root-cause diagnosis: WHY is this ad underperforming?"""
+    ctr = float(ad.get("ctr", 0))
+    cpm = float(ad.get("cpm", 0))
+    results = ad.get("results", 0)
+    spend = ad.get("spend", 0)
+    clicks = ad.get("clicks", 0)
+    frequency = float(ad.get("frequency", 1))
+    cost_per_result = ad.get("cost_per_result")
+    quality_ranking = ad.get("quality_ranking")
+    engagement_ranking = ad.get("engagement_rate_ranking")
+    conversion_ranking = ad.get("conversion_rate_ranking")
 
-    win = baselines.winning_threshold(metric)
-    lose = baselines.losing_threshold(metric)
+    objective = ad.get("objective", "") or ""
+    obj_bl = baselines.per_objective_creative.get(objective, {})
+    bl_ctr = obj_bl.get("avg_ctr", baselines.avg_ctr)
+    bl_cpm = obj_bl.get("avg_cpm", baselines.avg_cpm)
 
-    if win is None or lose is None:
-        # No baseline — can't evaluate properly
-        return "hold"
+    issues = []
 
-    if value <= win:
-        return "scale"
-    if value >= lose:
-        return "underperforming"
-    return "hold"
+    # Pattern 1: Creative problem — low CTR
+    if bl_ctr > 0 and ctr < bl_ctr * 0.7:
+        if bl_cpm > 0 and cpm <= bl_cpm * 1.3:
+            issues.append(f"CREATIVE: Low CTR ({ctr:.2f}% vs {bl_ctr:.2f}% baseline) with normal CPM — ad copy/visual isn't resonating")
+        else:
+            issues.append(f"CREATIVE + AUDIENCE: Low CTR ({ctr:.2f}% vs {bl_ctr:.2f}%) AND high CPM (${cpm:.0f} vs ${bl_cpm:.0f}) — both creative and targeting need work")
+
+    # Pattern 2: Audience saturation — high CPM, decent CTR
+    if bl_cpm > 0 and cpm > bl_cpm * 1.5 and (bl_ctr == 0 or ctr >= bl_ctr * 0.8):
+        issues.append(f"AUDIENCE: High CPM (${cpm:.0f} vs ${bl_cpm:.0f} baseline) — audience saturated or too narrow, broaden targeting")
+
+    # Pattern 3: Landing page problem — good CTR but no/poor conversions
+    if bl_ctr > 0 and ctr >= bl_ctr * 0.9 and clicks > 20 and results == 0 and spend > 50:
+        issues.append(f"LANDING PAGE: Strong CTR ({ctr:.2f}%) and {clicks} clicks but 0 conversions — check landing page or form")
+    elif bl_ctr > 0 and ctr >= bl_ctr * 0.9 and cost_per_result and baselines.avg_cpl and cost_per_result > baselines.avg_cpl * 1.5:
+        issues.append(f"FUNNEL LEAK: Good CTR ({ctr:.2f}%) but high cost/result (${cost_per_result:.0f} vs ${baselines.avg_cpl:.0f} baseline) — traffic quality or LP friction")
+
+    # Pattern 4: Ad fatigue
+    if frequency > 3.0:
+        issues.append(f"FATIGUE: Frequency {frequency:.1f} (ideal < 2.5) — refresh creative or expand audience")
+
+    # Pattern 5: Meta quality signals
+    if quality_ranking in ("BELOW_AVERAGE_10", "BELOW_AVERAGE_20", "BELOW_AVERAGE_35"):
+        issues.append(f"META QUALITY: Ranked '{quality_ranking}' — improve visual quality or relevance")
+    if conversion_ranking in ("BELOW_AVERAGE_10", "BELOW_AVERAGE_20", "BELOW_AVERAGE_35"):
+        issues.append(f"META CONVERSION: Ranked '{conversion_ranking}' — landing page or offer not compelling vs competitors")
+    if engagement_ranking in ("BELOW_AVERAGE_10", "BELOW_AVERAGE_20", "BELOW_AVERAGE_35"):
+        issues.append(f"META ENGAGEMENT: Ranked '{engagement_ranking}' — ad not generating engagement vs similar ads")
+
+    # Pattern 6: Good creative, bad conversion — psychology/LP issue
+    if bl_ctr > 0 and ctr >= bl_ctr * 1.2 and results > 0 and cost_per_result:
+        avg_cpr = baselines.avg_cpl or baselines.avg_cpa
+        if avg_cpr and cost_per_result > avg_cpr * 1.3:
+            issues.append(f"PSYCHOLOGY: Strong ad engagement (CTR {ctr:.2f}%) but poor conversion — landing page may lack social proof, urgency, or clear value proposition")
+
+    # Pattern 7: High spend, low results, decent metrics — wrong objective
+    if spend > 100 and results == 0 and ctr > 1.0 and clicks > 50:
+        issues.append(f"OBJECTIVE MISMATCH: {clicks} clicks with 0 conversions — campaign objective may not match the desired action, or conversion tracking isn't set up")
+
+    if not issues:
+        if verdict == "scale":
+            return "HEALTHY: Performing above baseline across all metrics"
+        elif verdict == "hold":
+            return "STABLE: Within normal range, no critical issues"
+        return ""
+
+    return " | ".join(issues)
 
 
-def _evaluate_value_metric(
-    value: float | None,
-    baselines: AccountBaselines,
-    metric: str,
-) -> str:
-    """Evaluate a value metric (higher is better): ROAS, CTR."""
-    if value is None:
-        return "no_data"
-
-    win = baselines.winning_threshold(metric)
-    lose = baselines.losing_threshold(metric)
-
-    if win is None or lose is None:
-        return "hold"
-
-    if value >= win:
-        return "scale"
-    if value <= lose:
-        return "underperforming"
-    return "hold"
-
-
-def _build_evaluation(ad: dict, baselines: AccountBaselines, verdict: str) -> dict:
+def _build_evaluation(ad: dict, baselines: AccountBaselines, verdict: str,
+                       score: int = 0, components: dict | None = None) -> dict:
     """Build a diagnostic context object comparing ad metrics to baselines."""
     spend = ad.get("spend", 0)
     cpl = ad.get("cost_per_result")
@@ -338,8 +541,13 @@ def _build_evaluation(ad: dict, baselines: AccountBaselines, verdict: str) -> di
 
     evaluation: dict[str, Any] = {
         "verdict": verdict,
+        "score": score,
+        "components": components or {},
         "dominant_type": baselines.dominant_type,
         "baseline_source": baselines.source,
+        "quality_ranking": ad.get("quality_ranking"),
+        "engagement_rate_ranking": ad.get("engagement_rate_ranking"),
+        "conversion_rate_ranking": ad.get("conversion_rate_ranking"),
     }
 
     # Primary metric comparison
@@ -362,17 +570,23 @@ def _build_evaluation(ad: dict, baselines: AccountBaselines, verdict: str) -> di
             "status": "above" if pct > 0 else "below",
         }
 
-    # Secondary metrics
+    # Secondary metrics — use per-objective baselines when available
+    objective = ad.get("objective", "") or ""
+    obj_bl = baselines.per_objective_creative.get(objective, {})
+    bl_ctr = obj_bl.get("avg_ctr", baselines.avg_ctr)
+    bl_cpc = obj_bl.get("avg_cpc", baselines.avg_cpc)
+    bl_cpm = obj_bl.get("avg_cpm", baselines.avg_cpm)
+
     secondaries = []
-    if baselines.avg_ctr > 0:
-        pct = round((ctr - baselines.avg_ctr) / baselines.avg_ctr * 100, 1)
-        secondaries.append({"metric": "CTR", "value": ctr, "baseline": baselines.avg_ctr, "delta_pct": pct})
-    if baselines.avg_cpm > 0 and cpm > 0:
-        pct = round((cpm - baselines.avg_cpm) / baselines.avg_cpm * 100, 1)
-        secondaries.append({"metric": "CPM", "value": cpm, "baseline": baselines.avg_cpm, "delta_pct": pct})
-    if baselines.avg_cpc > 0 and cpc > 0:
-        pct = round((cpc - baselines.avg_cpc) / baselines.avg_cpc * 100, 1)
-        secondaries.append({"metric": "CPC", "value": cpc, "baseline": baselines.avg_cpc, "delta_pct": pct})
+    if bl_ctr > 0:
+        pct = round((ctr - bl_ctr) / bl_ctr * 100, 1)
+        secondaries.append({"metric": "CTR", "value": ctr, "baseline": bl_ctr, "delta_pct": pct})
+    if bl_cpm > 0 and cpm > 0:
+        pct = round((cpm - bl_cpm) / bl_cpm * 100, 1)
+        secondaries.append({"metric": "CPM", "value": cpm, "baseline": bl_cpm, "delta_pct": pct})
+    if bl_cpc > 0 and cpc > 0:
+        pct = round((cpc - bl_cpc) / bl_cpc * 100, 1)
+        secondaries.append({"metric": "CPC", "value": cpc, "baseline": bl_cpc, "delta_pct": pct})
 
     evaluation["secondaries"] = secondaries
     return evaluation
@@ -421,5 +635,15 @@ def build_diagnostic_prompt(ad: dict, baselines: AccountBaselines) -> str:
         else:
             note = "Flagged"
         parts.append(f"{sec['metric']}: {sec['value']:.2f} (Avg: {sec['baseline']:.2f}, {direction}{delta}%) [{note}]")
+
+    qr = ad.get("quality_ranking")
+    if qr and qr != "UNKNOWN":
+        parts.append(f"Quality: {qr}")
+    er = ad.get("engagement_rate_ranking")
+    if er and er != "UNKNOWN":
+        parts.append(f"Engagement: {er}")
+    cr = ad.get("conversion_rate_ranking")
+    if cr and cr != "UNKNOWN":
+        parts.append(f"Conversion: {cr}")
 
     return " | ".join(parts) if parts else "Insufficient data for comparison."

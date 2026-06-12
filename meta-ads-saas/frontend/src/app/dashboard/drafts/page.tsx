@@ -2,6 +2,7 @@
 
 import { useEffect, useState, useCallback, useRef } from "react";
 import { api, resolveImageUrl } from "@/lib/api";
+import { useWorkspace } from "@/contexts/WorkspaceContext";
 import {
   CheckCircle2,
   XCircle,
@@ -26,6 +27,11 @@ import {
   ClipboardList,
   Phone,
   MessagesSquare,
+  GripVertical,
+  Copy,
+  Check,
+  ChevronRight,
+  Code,
 } from "lucide-react";
 
 /* ── Types ────────────────────────────────────────────────── */
@@ -40,7 +46,20 @@ type AbVariants = {
 type TargetingSpec = {
   target_country?: string;
   validated_interests?: { id: string; name: string; audience_size?: number }[];
+  validated_behaviors?: { id: string; name: string; audience_size?: number }[];
   suggested_keywords?: string[];
+  advantage_plus_expanded?: boolean;
+};
+
+type TargetingDiff = {
+  severity: "clean" | "partial" | "heavy" | "total_strip" | "no_interests_sent";
+  sent_count: number;
+  kept_count: number;
+  stripped_count: number;
+  stripped_interests: { id: string; name: string }[];
+  kept_interests: { id: string; name: string }[];
+  advantage_audience_active: boolean;
+  reconciled_at: string;
 };
 
 type MediaItem = {
@@ -72,12 +91,38 @@ type Draft = {
   conversion_event: string | null;
   thumbnail_url: string | null;
   destination_type: string | null;
+  campaign_objective: string | null;
+  is_carousel?: boolean | null;
   whatsapp_number: string | null;
   media_items: MediaItem[] | null;
   lead_form_id: string | null;
   selected_messaging_apps: string[] | null;
   call_phone_number: string | null;
+  special_ad_category: string | null;
+  special_ad_category_confidence: number | null;
+  special_ad_category_reasoning: string | null;
+  // Post-publish reconciliation against Meta's actual applied targeting.
+  // Populated by sac_reconciler ~30s after a successful SAC publish.
+  actual_targeting: Record<string, unknown> | null;
+  targeting_diff: TargetingDiff | null;
+  // Phase B SAC auto-recovery state — populated by sac_recovery when the
+  // reconciler sees severity=heavy/total_strip and replacement interests
+  // are PATCHed onto the live ad set.
+  auto_recovery_status: string | null;       // pending | recovered | no_alternatives | llm_failed | patch_failed
+  auto_recovery_attempts: number | null;
+  recovered_interests: { id: string; name: string }[] | null;
   created_at: string;
+};
+
+// Meta SAC code → human label + tailwind color class.
+// Tier-2 (HEC) categories use red/amber; Financial uses indigo; auth-required uses violet.
+const SAC_DISPLAY: Record<string, { label: string; color: string }> = {
+  HOUSING: { label: "Housing", color: "bg-amber-500/10 text-amber-300 border-amber-500/30" },
+  EMPLOYMENT: { label: "Employment", color: "bg-amber-500/10 text-amber-300 border-amber-500/30" },
+  CREDIT: { label: "Credit", color: "bg-amber-500/10 text-amber-300 border-amber-500/30" },
+  FINANCIAL_PRODUCTS_SERVICES: { label: "Financial Products", color: "bg-indigo-500/10 text-indigo-300 border-indigo-500/30" },
+  ISSUES_ELECTIONS_POLITICS: { label: "Politics / Issues", color: "bg-violet-500/10 text-violet-300 border-violet-500/30" },
+  ONLINE_GAMBLING_AND_GAMING: { label: "Gambling", color: "bg-violet-500/10 text-violet-300 border-violet-500/30" },
 };
 
 type FilterTab = "all" | "pending" | "approved" | "active" | "rejected";
@@ -187,6 +232,15 @@ const CONVERSION_EVENTS = [
   { value: "CONTACT", label: "Contact (Clicks to call/email)", desc: "Optimize for contact actions" },
 ];
 
+const EVENT_SNIPPETS: Record<string, { code: string; page: string }> = {
+  PURCHASE: { code: "fbq('track', 'Purchase', {value: 0.00, currency: 'USD'});", page: "order confirmation / thank-you page" },
+  LEAD: { code: "fbq('track', 'Lead');", page: "form submission success page" },
+  COMPLETE_REGISTRATION: { code: "fbq('track', 'CompleteRegistration');", page: "registration success / welcome page" },
+  ADD_TO_CART: { code: "fbq('track', 'AddToCart');", page: "add-to-cart button click handler" },
+  INITIATE_CHECKOUT: { code: "fbq('track', 'InitiateCheckout');", page: "checkout page load" },
+  CONTACT: { code: "fbq('track', 'Contact');", page: "contact form success page" },
+};
+
 /* ── Pixel Attach Modal ───────────────────────────────── */
 
 function PixelAttachModal({
@@ -208,6 +262,15 @@ function PixelAttachModal({
   const [newPixelName, setNewPixelName] = useState("");
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
+  const [pixelBaseCode, setPixelBaseCode] = useState<string | null>(null);
+  const [showTrackingCodes, setShowTrackingCodes] = useState(false);
+  const [copiedSnippet, setCopiedSnippet] = useState<string | null>(null);
+
+  const copySnippet = (text: string, key: string) => {
+    navigator.clipboard.writeText(text);
+    setCopiedSnippet(key);
+    setTimeout(() => setCopiedSnippet(null), 2000);
+  };
 
   const fetchPixels = useCallback(async () => {
     setLoadingPixels(true);
@@ -231,12 +294,17 @@ function PixelAttachModal({
     setCreateError(null);
     try {
       const res = await api.createPixel(newPixelName.trim());
-      const data = (res as unknown as { data: { pixel_id: string; pixel_name: string } }).data;
-      if (data?.pixel_id) {
-        setSelectedPixel(data.pixel_id);
-        setPixels((prev) => [...prev, { id: data.pixel_id, name: data.pixel_name || newPixelName }]);
+      const data = (res as unknown as { data: { pixel_id?: string; id?: string; name?: string; pixel_name?: string; already_existed?: boolean; base_code?: string } }).data;
+      const pixelId = data?.pixel_id || data?.id;
+      const pixelName = data?.name || data?.pixel_name || newPixelName;
+      if (pixelId) {
+        setSelectedPixel(pixelId);
+        setPixels((prev) => [...prev, { id: pixelId, name: pixelName }]);
+        setPixelBaseCode(data?.base_code || null);
         setTab("select");
         setNewPixelName("");
+      } else {
+        setCreateError("Pixel creation returned no ID. Try again.");
       }
     } catch {
       setCreateError("Failed to create pixel. Check your Meta connection.");
@@ -245,13 +313,33 @@ function PixelAttachModal({
   };
 
   const selectedPixelName = pixels.find((p) => p.id === selectedPixel)?.name || selectedPixel;
+  const selectedEventLabel = CONVERSION_EVENTS.find((e) => e.value === selectedEvent)?.label?.split(" (")[0] || selectedEvent;
+
+  // Generate base code from pixel ID (standard Meta Pixel template)
+  const baseCodeForPixel = selectedPixel ? `<!-- Meta Pixel Code -->
+<script>
+!function(f,b,e,v,n,t,s)
+{f.fbq||(n=f.fbq=function(){n.callMethod?
+n.callMethod.apply(n,arguments):n.queue.push(arguments)},
+f._fbq||(f._fbq=n),n.push=n,n.loaded=!0,n.version='2.0',
+n.queue=[],t=b.createElement(e),t.async=!0,
+t.src=v,s=b.getElementsByTagName(e)[0],
+s.parentNode.insertBefore(t,s))}(window, document,'script',
+'https://connect.facebook.net/en_US/fbevents.js');
+fbq('init', '${selectedPixel}');
+fbq('track', 'PageView');
+</script>
+<noscript><img height="1" width="1" style="display:none"
+src="https://www.facebook.com/tr?id=${selectedPixel}&ev=PageView&noscript=1"
+/></noscript>
+<!-- End Meta Pixel Code -->` : null;
 
   return (
     <div className="fixed inset-0 z-[60] flex items-center justify-center p-4">
       <div className="absolute inset-0 bg-black/70 backdrop-blur-sm" onClick={onClose} />
-      <div className="relative w-full max-w-md bg-[#141418] border border-white/[0.08] rounded-2xl overflow-hidden animate-slide-up">
+      <div className="relative w-full max-w-lg bg-[#141418] border border-white/[0.08] rounded-2xl overflow-hidden animate-slide-up max-h-[90vh] flex flex-col">
         {/* Header */}
-        <div className="flex items-center justify-between px-5 py-4 border-b border-white/[0.06]">
+        <div className="flex items-center justify-between px-5 py-4 border-b border-white/[0.06] shrink-0">
           <div className="flex items-center gap-2">
             <Zap className="w-4 h-4 text-amber-400" />
             <h3 className="text-sm font-semibold text-white">Attach Meta Pixel</h3>
@@ -262,7 +350,7 @@ function PixelAttachModal({
         </div>
 
         {/* Tabs */}
-        <div className="flex border-b border-white/[0.06]">
+        <div className="flex border-b border-white/[0.06] shrink-0">
           <button onClick={() => setTab("select")}
             className={`flex-1 px-4 py-2.5 text-xs font-medium transition-all ${tab === "select" ? "text-amber-400 border-b-2 border-amber-400 bg-amber-500/[0.05]" : "text-gray-500 hover:text-gray-300"}`}>
             Select Existing
@@ -273,79 +361,163 @@ function PixelAttachModal({
           </button>
         </div>
 
-        <div className="px-5 py-5 space-y-4">
-          {tab === "select" ? (
-            <>
-              {loadingPixels ? (
-                <div className="flex items-center justify-center py-8">
-                  <Loader2 className="w-5 h-5 animate-spin text-gray-500" />
-                </div>
-              ) : pixels.length === 0 ? (
-                <div className="text-center py-6">
-                  <p className="text-sm text-gray-400 mb-2">No pixels found on this account.</p>
-                  <button onClick={() => setTab("create")} className="text-xs text-amber-400 hover:text-amber-300 font-medium">
-                    Create your first pixel
-                  </button>
-                </div>
-              ) : (
-                <div>
-                  <label className="text-xs text-gray-500 mb-1.5 block">Select Pixel</label>
-                  <div className="relative">
-                    <select value={selectedPixel} onChange={(e) => setSelectedPixel(e.target.value)}
-                      className="w-full px-3 py-2.5 rounded-xl bg-white/[0.04] border border-white/[0.08] text-white text-sm focus:outline-none focus:border-amber-500/40 transition-all appearance-none">
-                      {pixels.map((p) => (
-                        <option key={p.id} value={p.id}>{p.name} ({p.id})</option>
-                      ))}
-                    </select>
-                    <ChevronDown className="absolute right-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-gray-500 pointer-events-none" />
+        {/* Scrollable content */}
+        <div className="overflow-y-auto flex-1 min-h-0">
+          <div className="px-5 py-5 space-y-5">
+            {tab === "select" ? (
+              <>
+                {/* Pixel selector */}
+                {loadingPixels ? (
+                  <div className="flex items-center justify-center py-8">
+                    <Loader2 className="w-5 h-5 animate-spin text-gray-500" />
                   </div>
-                </div>
-              )}
-            </>
-          ) : (
-            <div className="space-y-3">
-              <div>
-                <label className="text-xs text-gray-500 mb-1.5 block">Pixel Name</label>
-                <input type="text" value={newPixelName} onChange={(e) => setNewPixelName(e.target.value)}
-                  placeholder="e.g. My Store Pixel"
-                  className="w-full px-3 py-2.5 rounded-xl bg-white/[0.04] border border-white/[0.08] text-white text-sm placeholder-gray-600 focus:outline-none focus:border-amber-500/40 transition-all" />
-              </div>
-              {createError && <p className="text-xs text-red-400">{createError}</p>}
-              <button onClick={handleCreate} disabled={creating || !newPixelName.trim()}
-                className="flex items-center justify-center gap-2 w-full px-4 py-2.5 rounded-xl text-sm font-semibold bg-amber-500/90 hover:bg-amber-500 text-black transition-all disabled:opacity-40">
-                {creating ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Plus className="w-3.5 h-3.5" />}
-                Create Pixel
-              </button>
-            </div>
-          )}
+                ) : pixels.length === 0 ? (
+                  <div className="text-center py-6">
+                    <p className="text-sm text-gray-400 mb-2">No pixels found on this account.</p>
+                    <button onClick={() => setTab("create")} className="text-xs text-amber-400 hover:text-amber-300 font-medium">
+                      Create your first pixel
+                    </button>
+                  </div>
+                ) : (
+                  <div>
+                    <label className="text-xs text-gray-500 mb-1.5 block">Select Pixel</label>
+                    <div className="relative">
+                      <select value={selectedPixel} onChange={(e) => setSelectedPixel(e.target.value)}
+                        className="w-full px-3 py-2.5 rounded-xl bg-white/[0.04] border border-white/[0.08] text-white text-sm focus:outline-none focus:border-amber-500/40 transition-all appearance-none">
+                        {pixels.map((p) => (
+                          <option key={p.id} value={p.id}>{p.name} ({p.id})</option>
+                        ))}
+                      </select>
+                      <ChevronDown className="absolute right-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-gray-500 pointer-events-none" />
+                    </div>
+                  </div>
+                )}
 
-          {/* Event Selection — shown when a pixel is selected */}
-          {selectedPixel && tab === "select" && (
-            <div>
-              <label className="text-xs text-gray-500 mb-1.5 block">Optimization Event</label>
-              <p className="text-[10px] text-gray-600 mb-2">Select the action you want Meta to optimize this ad for.</p>
-              <div className="space-y-1.5">
-                {CONVERSION_EVENTS.map((ev) => (
-                  <label key={ev.value}
-                    className={`flex items-center gap-3 px-3 py-2.5 rounded-xl cursor-pointer transition-all border ${selectedEvent === ev.value ? "bg-amber-500/[0.08] border-amber-500/20" : "bg-white/[0.02] border-white/[0.06] hover:bg-white/[0.04]"}`}>
-                    <input type="radio" name="conv_event" value={ev.value} checked={selectedEvent === ev.value}
-                      onChange={(e) => setSelectedEvent(e.target.value)} className="hidden" />
-                    <div className={`w-3.5 h-3.5 rounded-full border-2 flex items-center justify-center ${selectedEvent === ev.value ? "border-amber-400" : "border-gray-600"}`}>
-                      {selectedEvent === ev.value && <div className="w-1.5 h-1.5 rounded-full bg-amber-400" />}
+                {/* ─── AREA 1: Global Website Tracking (collapsible) ─── */}
+                {selectedPixel && (
+                  <div className="rounded-xl border border-white/[0.06] overflow-hidden">
+                    <button
+                      onClick={() => setShowTrackingCodes(!showTrackingCodes)}
+                      className="w-full flex items-center gap-3 px-4 py-3 hover:bg-white/[0.02] transition-all"
+                    >
+                      <div className="w-6 h-6 rounded-lg bg-blue-500/10 flex items-center justify-center shrink-0">
+                        <Code className="w-3.5 h-3.5 text-blue-400" />
+                      </div>
+                      <div className="flex-1 text-left">
+                        <p className="text-xs font-semibold text-white">1. Website Tracking Codes</p>
+                        <p className="text-[10px] text-gray-500">Base pixel + all event snippets for your site</p>
+                      </div>
+                      <ChevronRight className={`w-3.5 h-3.5 text-gray-500 transition-transform ${showTrackingCodes ? "rotate-90" : ""}`} />
+                    </button>
+
+                    {showTrackingCodes && (
+                      <div className="border-t border-white/[0.06] px-4 py-3 space-y-3">
+                        <p className="text-[10px] text-gray-500">
+                          Install the <span className="text-blue-300">Base Code</span> on every page. Add <span className="text-amber-300">Event Codes</span> on pages where each action happens.
+                        </p>
+
+                        {/* Base Pixel Code — always available when a pixel is selected */}
+                        {baseCodeForPixel && (
+                          <div className="rounded-lg bg-[#0d1117] border border-white/[0.08] overflow-hidden">
+                            <div className="flex items-center justify-between px-3 py-1.5 border-b border-white/[0.06]">
+                              <p className="text-[10px] font-medium text-blue-400">Base Pixel Code — install on ALL pages</p>
+                              <button onClick={() => copySnippet(baseCodeForPixel, "base")}
+                                className="flex items-center gap-1 text-[10px] text-gray-400 hover:text-white px-1.5 py-0.5 rounded bg-white/[0.06]">
+                                {copiedSnippet === "base" ? <Check className="w-2.5 h-2.5 text-emerald-400" /> : <Copy className="w-2.5 h-2.5" />}
+                                {copiedSnippet === "base" ? "Copied!" : "Copy"}
+                              </button>
+                            </div>
+                            <pre className="px-3 py-2 text-[9px] text-gray-500 leading-relaxed overflow-x-auto max-h-24 overflow-y-auto">{baseCodeForPixel}</pre>
+                          </div>
+                        )}
+
+                        {/* All Event Snippets */}
+                        <div className="space-y-1">
+                          {Object.entries(EVENT_SNIPPETS).map(([key, snippet]) => (
+                            <div key={key} className="flex items-center gap-2 px-3 py-2 rounded-lg bg-white/[0.02] border border-white/[0.04]">
+                              <div className="flex-1 min-w-0">
+                                <p className="text-[10px] font-medium text-amber-300/90">{CONVERSION_EVENTS.find((e) => e.value === key)?.label?.split(" (")[0] || key}</p>
+                                <code className="text-[10px] font-mono text-gray-400 block truncate">{snippet.code}</code>
+                                <p className="text-[9px] text-gray-600">Install on: {snippet.page}</p>
+                              </div>
+                              <button onClick={() => copySnippet(snippet.code, key)}
+                                className="shrink-0 flex items-center gap-1 text-[10px] text-gray-500 hover:text-white px-2 py-1 rounded bg-white/[0.04]">
+                                {copiedSnippet === key ? <Check className="w-2.5 h-2.5 text-emerald-400" /> : <Copy className="w-2.5 h-2.5" />}
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* ─── AREA 2: Campaign Optimization Goal ─── */}
+                {selectedPixel && (
+                  <div className="rounded-xl border border-amber-500/10 bg-amber-500/[0.02] overflow-hidden">
+                    <div className="px-4 py-3 border-b border-amber-500/10">
+                      <div className="flex items-center gap-2 mb-1">
+                        <div className="w-6 h-6 rounded-lg bg-amber-500/10 flex items-center justify-center shrink-0">
+                          <Target className="w-3.5 h-3.5 text-amber-400" />
+                        </div>
+                        <p className="text-xs font-semibold text-white">2. Optimization Goal for this Ad</p>
+                      </div>
+                      <p className="text-[10px] text-gray-500 ml-8">
+                        Choose ONE goal. Meta&apos;s AI will find people most likely to take this action.
+                      </p>
                     </div>
-                    <div className="flex-1">
-                      <span className="text-sm text-white">{ev.label}</span>
-                      <p className="text-[10px] text-gray-500">{ev.desc}</p>
+                    <div className="px-4 py-3">
+                      <div className="grid grid-cols-2 gap-1.5">
+                        {CONVERSION_EVENTS.map((ev) => (
+                          <label key={ev.value}
+                            className={`flex items-center gap-2 px-3 py-2 rounded-lg cursor-pointer transition-all border ${
+                              selectedEvent === ev.value
+                                ? "bg-amber-500/10 border-amber-500/30 text-white"
+                                : "bg-white/[0.02] border-white/[0.06] text-gray-400 hover:bg-white/[0.04] hover:text-gray-200"
+                            }`}>
+                            <input type="radio" name="conv_event" value={ev.value} checked={selectedEvent === ev.value}
+                              onChange={(e) => setSelectedEvent(e.target.value)} className="hidden" />
+                            <div className={`w-3 h-3 rounded-full border-2 flex items-center justify-center shrink-0 ${
+                              selectedEvent === ev.value ? "border-amber-400" : "border-gray-600"
+                            }`}>
+                              {selectedEvent === ev.value && <div className="w-1.5 h-1.5 rounded-full bg-amber-400" />}
+                            </div>
+                            <span className="text-xs font-medium leading-tight">{ev.label.split(" (")[0]}</span>
+                          </label>
+                        ))}
+                      </div>
+                      {/* Dynamic confirmation text */}
+                      {selectedEvent && (
+                        <p className="text-[10px] text-amber-400/70 mt-2.5 ml-0.5">
+                          Meta will optimize this ad to get you more <span className="font-semibold text-amber-300">{selectedEventLabel}s</span>. Make sure the {selectedEventLabel} tracking code is installed on your website.
+                        </p>
+                      )}
                     </div>
-                  </label>
-                ))}
+                  </div>
+                )}
+              </>
+            ) : (
+              /* Create New tab */
+              <div className="space-y-3">
+                <div>
+                  <label className="text-xs text-gray-500 mb-1.5 block">Pixel Name</label>
+                  <input type="text" value={newPixelName} onChange={(e) => setNewPixelName(e.target.value)}
+                    placeholder="e.g. My Store Pixel"
+                    className="w-full px-3 py-2.5 rounded-xl bg-white/[0.04] border border-white/[0.08] text-white text-sm placeholder-gray-600 focus:outline-none focus:border-amber-500/40 transition-all" />
+                </div>
+                {createError && <p className="text-xs text-red-400">{createError}</p>}
+                <button onClick={handleCreate} disabled={creating || !newPixelName.trim()}
+                  className="flex items-center justify-center gap-2 w-full px-4 py-2.5 rounded-xl text-sm font-semibold bg-amber-500/90 hover:bg-amber-500 text-black transition-all disabled:opacity-40">
+                  {creating ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Plus className="w-3.5 h-3.5" />}
+                  Create Pixel
+                </button>
               </div>
-            </div>
-          )}
+            )}
+          </div>
         </div>
 
         {/* Footer */}
-        <div className="flex gap-2 px-5 py-4 border-t border-white/[0.06]">
+        <div className="flex gap-2 px-5 py-4 border-t border-white/[0.06] shrink-0">
           <button onClick={onClose} className="flex-1 px-4 py-2.5 rounded-xl text-sm text-gray-400 bg-white/[0.03] border border-white/[0.06] hover:text-white transition-all">
             Cancel
           </button>
@@ -364,7 +536,7 @@ function PixelAttachModal({
 /* ── Lead Form Types ─────────────────────────────────────── */
 
 const FIELD_TYPE_LABELS: Record<string, string> = {
-  FULL_NAME: "Full Name", EMAIL: "Email", PHONE_NUMBER: "Phone Number",
+  FULL_NAME: "Full Name", EMAIL: "Email", PHONE: "Phone Number",
   CITY: "City", COMPANY_NAME: "Company Name", JOB_TITLE: "Job Title",
   STATE: "State", ZIP: "ZIP Code", STREET_ADDRESS: "Street Address",
   DATE_OF_BIRTH: "Date of Birth", CUSTOM: "Custom Question",
@@ -373,14 +545,14 @@ const FIELD_TYPE_LABELS: Record<string, string> = {
 const STANDARD_FIELD_OPTIONS = [
   { type: "FULL_NAME", key: "full_name" },
   { type: "EMAIL", key: "email" },
-  { type: "PHONE_NUMBER", key: "phone_number" },
+  { type: "PHONE", key: "phone_number" },
   { type: "CITY", key: "city" },
   { type: "COMPANY_NAME", key: "company_name" },
   { type: "JOB_TITLE", key: "job_title" },
 ];
 
 type LeadFormQuestion = { type: string; key: string; label?: string };
-type SavedLeadForm = { id: string; meta_form_id: string; form_name: string; questions: LeadFormQuestion[]; page_id: string; created_at: string };
+type SavedLeadForm = { id: string; meta_form_id: string; form_name: string; questions: LeadFormQuestion[]; page_id: string; created_at: string; source?: string; status?: string };
 
 /* ── Lead Form Builder Modal (AI-First) ─────────────────── */
 
@@ -395,6 +567,8 @@ function LeadFormBuilder({
   currentFormId: string | null;
   draftId?: string;
 }) {
+  const { activeWorkspace } = useWorkspace();
+  const wsPageId = activeWorkspace?.meta_page_id || "";
   const [tab, setTab] = useState<"ai" | "select" | "manual">("ai");
   const [savedForms, setSavedForms] = useState<SavedLeadForm[]>([]);
   const [loadingForms, setLoadingForms] = useState(true);
@@ -414,18 +588,22 @@ function LeadFormBuilder({
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
 
-  // Page ID
+  // Page ID — auto-select workspace page
   const [pages, setPages] = useState<{ page_id: string; page_name: string }[]>([]);
   const [selectedPage, setSelectedPage] = useState("");
 
-  // Load pages + saved forms on mount
+  // Load pages + saved forms on mount — prefer workspace's linked page
   useEffect(() => {
     api.fetchSocialIdentities()
       .then((res: unknown) => {
         const data = (res as { data: { pages: { page_id: string; page_name: string }[] } }).data;
         const pageList = data?.pages || [];
         setPages(pageList);
-        if (pageList.length > 0 && !selectedPage) setSelectedPage(pageList[0].page_id);
+        if (pageList.length > 0 && !selectedPage) {
+          // Auto-select the workspace's linked page if available
+          const wsMatch = wsPageId ? pageList.find((p: { page_id: string }) => p.page_id === wsPageId) : null;
+          setSelectedPage(wsMatch ? wsMatch.page_id : pageList[0].page_id);
+        }
       })
       .catch(() => {});
   }, []);
@@ -434,7 +612,8 @@ function LeadFormBuilder({
     setLoadingForms(true);
     api.listLeadForms()
       .then((res: unknown) => {
-        const data = (res as { data: SavedLeadForm[] }).data || [];
+        const raw = (res as { data: SavedLeadForm[] | SavedLeadForm }).data;
+        const data = Array.isArray(raw) ? raw : raw ? [raw] : [];
         setSavedForms(data);
         if (!selectedFormId && data.length > 0) {
           setSelectedFormId(currentFormId || data[0].meta_form_id);
@@ -467,7 +646,7 @@ function LeadFormBuilder({
       setAiFormName("Lead Form");
       setAiQuestions([
         { type: "FULL_NAME", key: "full_name" },
-        { type: "PHONE_NUMBER", key: "phone_number" },
+        { type: "PHONE", key: "phone_number" },
         { type: "EMAIL", key: "email" },
       ]);
       setAiGenerated(true);
@@ -528,12 +707,34 @@ function LeadFormBuilder({
 
   const selectedFormName = savedForms.find((f) => f.meta_form_id === selectedFormId)?.form_name || selectedFormId;
 
-  // Shared question editor component
+  // Drag-to-reorder state
+  const [dragIdx, setDragIdx] = useState<number | null>(null);
+  const [dragOverIdx, setDragOverIdx] = useState<number | null>(null);
+
+  const handleReorder = (qs: LeadFormQuestion[], fromIdx: number, toIdx: number) => {
+    if (fromIdx === toIdx) return;
+    const updated = [...qs];
+    const [moved] = updated.splice(fromIdx, 1);
+    updated.splice(toIdx, 0, moved);
+    if (tab === "ai") setAiQuestions(updated);
+    else setQuestions(updated);
+  };
+
+  // Shared question editor component with drag-to-reorder
   const renderQuestionList = (qs: LeadFormQuestion[], onRemove: (i: number) => void) => (
     <div className="space-y-1.5">
       {qs.map((q, i) => (
         <div key={`${q.key}-${i}`}
-          className="flex items-center gap-2.5 px-3 py-2.5 rounded-xl bg-white/[0.03] border border-white/[0.06] group">
+          draggable
+          onDragStart={() => { setDragIdx(i); }}
+          onDragOver={(e) => { e.preventDefault(); setDragOverIdx(i); }}
+          onDragEnd={() => { if (dragIdx !== null && dragOverIdx !== null) handleReorder(qs, dragIdx, dragOverIdx); setDragIdx(null); setDragOverIdx(null); }}
+          className={`flex items-center gap-2.5 px-3 py-2.5 rounded-xl bg-white/[0.03] border transition-all group cursor-grab active:cursor-grabbing ${
+            dragOverIdx === i && dragIdx !== null && dragIdx !== i
+              ? "border-cyan-500/40 bg-cyan-500/[0.05]"
+              : "border-white/[0.06]"
+          } ${dragIdx === i ? "opacity-40" : ""}`}>
+          <GripVertical className="w-3.5 h-3.5 text-gray-600 shrink-0" />
           <div className="w-5 h-5 rounded-lg bg-cyan-500/10 border border-cyan-500/20 flex items-center justify-center text-[10px] font-bold text-cyan-400">
             {i + 1}
           </div>
@@ -641,18 +842,13 @@ function LeadFormBuilder({
                     </div>
                   )}
 
-                  {/* Page select */}
+                  {/* Page — auto-selected from workspace, read-only */}
                   {pages.length > 0 && (
                     <div>
                       <label className="text-xs text-gray-500 mb-1.5 block">Facebook Page</label>
-                      <div className="relative">
-                        <select value={selectedPage} onChange={(e) => setSelectedPage(e.target.value)}
-                          className="w-full px-3 py-2.5 rounded-xl bg-white/[0.04] border border-white/[0.08] text-white text-sm focus:outline-none focus:border-cyan-500/40 transition-all appearance-none">
-                          {pages.map((p) => (
-                            <option key={p.page_id} value={p.page_id}>{p.page_name}</option>
-                          ))}
-                        </select>
-                        <ChevronDown className="absolute right-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-gray-500 pointer-events-none" />
+                      <div className="px-3 py-2.5 rounded-xl bg-white/[0.04] border border-white/[0.08] text-white text-sm flex items-center gap-2">
+                        <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                        {pages.find(p => p.page_id === selectedPage)?.page_name || selectedPage}
                       </div>
                     </div>
                   )}
@@ -719,9 +915,16 @@ function LeadFormBuilder({
                         {selectedFormId === form.meta_form_id && <div className="w-1.5 h-1.5 rounded-full bg-cyan-400" />}
                       </div>
                       <div className="flex-1 min-w-0">
-                        <span className="text-sm text-white block truncate">{form.form_name}</span>
+                        <div className="flex items-center gap-2">
+                          <span className="text-sm text-white block truncate">{form.form_name}</span>
+                          {form.source === "meta" && (
+                            <span className="text-[9px] px-1.5 py-0.5 rounded bg-blue-500/10 text-blue-400 border border-blue-500/20 shrink-0">Meta</span>
+                          )}
+                        </div>
                         <span className="text-[10px] text-gray-500">
-                          {(form.questions || []).map((q: LeadFormQuestion) => FIELD_TYPE_LABELS[q.type] || q.label || q.key).join(", ")}
+                          {(form.questions || []).length > 0
+                            ? (form.questions || []).map((q: LeadFormQuestion) => FIELD_TYPE_LABELS[q.type] || q.label || q.key).join(", ")
+                            : form.source === "meta" ? "Live form from Meta" : "No fields"}
                         </span>
                       </div>
                     </label>
@@ -734,18 +937,13 @@ function LeadFormBuilder({
           {/* ── Manual Build Tab ── */}
           {tab === "manual" && (
             <div className="space-y-4">
-              {/* Page select */}
+              {/* Page — auto-selected from workspace */}
               {pages.length > 0 && (
                 <div>
                   <label className="text-xs text-gray-500 mb-1.5 block">Facebook Page</label>
-                  <div className="relative">
-                    <select value={selectedPage} onChange={(e) => setSelectedPage(e.target.value)}
-                      className="w-full px-3 py-2.5 rounded-xl bg-white/[0.04] border border-white/[0.08] text-white text-sm focus:outline-none focus:border-cyan-500/40 transition-all appearance-none">
-                      {pages.map((p) => (
-                        <option key={p.page_id} value={p.page_id}>{p.page_name}</option>
-                      ))}
-                    </select>
-                    <ChevronDown className="absolute right-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-gray-500 pointer-events-none" />
+                  <div className="px-3 py-2.5 rounded-xl bg-white/[0.04] border border-white/[0.08] text-white text-sm flex items-center gap-2">
+                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                    {pages.find(p => p.page_id === selectedPage)?.page_name || selectedPage}
                   </div>
                 </div>
               )}
@@ -847,6 +1045,7 @@ function DraftDetailModal({
   const [fallbackUrl, setFallbackUrl] = useState<string | null>(null);
   const [campaignDest, setCampaignDest] = useState<string>(draft.destination_type || "WEBSITE");
   const [conversionEvent, setConversionEvent] = useState<string>(draft.conversion_event || "PURCHASE");
+  const [campaignObjective, setCampaignObjective] = useState<string>(draft.campaign_objective || "");
   const [waNumber, setWaNumber] = useState(draft.whatsapp_number ?? "");
   const [showLeadFormModal, setShowLeadFormModal] = useState(false);
   const [attachedLeadFormName, setAttachedLeadFormName] = useState<string | null>(null);
@@ -909,6 +1108,32 @@ function DraftDetailModal({
   );
   const [showProfitTooltip, setShowProfitTooltip] = useState(false);
 
+  // Geo targeting state — draft-level override, fall back to preferences
+  const _specGeo = parseTargetingSpec(draft.targeting_spec);
+  const _draftCountry = (draft.targeting as Record<string, string>)?.target_country
+    || _specGeo?.target_country || draft.target_country || "";
+  const _draftCities = ((draft.targeting as Record<string, unknown>)?.target_cities as string[] ?? []).join(", ");
+  const [editCountry, setEditCountry] = useState(_draftCountry);
+  const [editCities, setEditCities] = useState(_draftCities);
+  const [prefsCountry, setPrefsCountry] = useState("");
+  const [prefsCities, setprefsCities] = useState("");
+
+  // Fetch preferences defaults for geo display
+  useEffect(() => {
+    api.getPreferences().then((res: { data?: { target_country?: string; target_cities?: string[] } }) => {
+      const pc = res?.data?.target_country || "PK";
+      const pCities = (res?.data?.target_cities || []).join(", ");
+      setPrefsCountry(pc);
+      setprefsCities(pCities);
+      if (!_draftCountry) setEditCountry(pc);
+      if (!_draftCities && pCities) setEditCities(pCities);
+    }).catch(() => {});
+  }, []);
+
+  // Effective initial values (for dirty-checking on save)
+  const _initCountry = _draftCountry || prefsCountry;
+  const _initCities = _draftCities || prefsCities;
+
   const mediaItems = getMediaItems(draft);
   const [activeMediaIdx, setActiveMediaIdx] = useState(0);
 
@@ -920,13 +1145,15 @@ function DraftDetailModal({
     try {
       const currentItems: MediaItem[] = [...(draft.media_items || [])];
       for (let i = 0; i < files.length; i++) {
-        if (currentItems.length >= 4) break;
+        if (currentItems.length >= 10) break;
         const file = files[i];
         const { data } = await api.uploadProductImage(file);
         const mtype = file.type.startsWith("video/") ? "video" : "image";
         currentItems.push({ type: mtype as "image" | "video", url: data.url });
       }
-      onDraftUpdate(draft.id, { media_items: currentItems, image_url: currentItems[0]?.url || null });
+      const updates: Record<string, unknown> = { media_items: currentItems, image_url: currentItems[0]?.url || null };
+      if (draft.status === "failed") { updates.status = "pending"; updates.error_message = null; }
+      onDraftUpdate(draft.id, updates);
     } catch { setUploadError("Failed to upload file."); }
     finally { setUploading(false); e.target.value = ""; }
   };
@@ -965,7 +1192,24 @@ function DraftDetailModal({
         ...(parsedMargin ? { profit_margin: parsedMargin } : { profit_margin: null }),
       };
     }
+    // Geo targeting overrides — write to BOTH the targeting JSON (for legacy
+    // readers) and the dedicated target_country column (what ad_executor reads
+    // as highest priority for multi-country support).
+    const citiesArr = editCities.split(",").map(c => c.trim()).filter(Boolean);
+    if (editCountry !== _initCountry || editCities !== _initCities) {
+      const base = (fields.targeting as Record<string, unknown>) || { ...existingTargeting, placements: draftPlacement, budget_currency: budgetCurrency };
+      fields.targeting = {
+        ...base,
+        ...(editCountry ? { target_country: editCountry } : {}),
+        target_cities: citiesArr.length > 0 ? citiesArr : null,
+      };
+      // Also persist to the column itself — ad_executor reads this directly.
+      (fields as Record<string, unknown>).target_country = editCountry || null;
+    }
     if (campaignDest !== (draft.destination_type || "WEBSITE")) fields.destination_type = campaignDest;
+    // Save campaign objective override (empty string = auto-detect)
+    const objValue = campaignObjective || null;
+    if (objValue !== (draft.campaign_objective || null)) fields.campaign_objective = objValue;
     // Save destination-specific fields & rigidly clear irrelevant data
     if (campaignDest === "WEBSITE") {
       fields.whatsapp_number = "";
@@ -1086,9 +1330,9 @@ function DraftDetailModal({
               {/* Add more / Replace buttons */}
               {isPending && (
                 <div className="absolute bottom-3 right-3 flex gap-2">
-                  {mediaItems.length < 4 && (
+                  {mediaItems.length < 10 && (
                     <label className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[11px] font-medium bg-black/60 backdrop-blur-sm text-white hover:bg-black/80 transition-all cursor-pointer border border-white/10">
-                      <Plus className="w-3 h-3" /> Add ({mediaItems.length}/4)
+                      <Plus className="w-3 h-3" /> Add ({mediaItems.length}/10)
                       <input type="file" accept="image/jpeg,image/png,image/webp,video/mp4,video/quicktime,video/webm" multiple onChange={handleFileUpload} className="hidden" />
                     </label>
                   )}
@@ -1106,7 +1350,7 @@ function DraftDetailModal({
                 <div className="flex gap-2">
                   <label className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-medium bg-white/[0.05] border border-dashed border-white/[0.12] text-gray-300 hover:bg-white/[0.08] transition-all cursor-pointer">
                     {uploading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Upload className="w-3.5 h-3.5" />}
-                    Upload Media (1-4 files)
+                    Upload Media (1-10 files)
                     <input type="file" accept="image/jpeg,image/png,image/webp,video/mp4,video/quicktime,video/webm" multiple onChange={handleFileUpload} className="hidden" />
                   </label>
                 </div>
@@ -1119,7 +1363,9 @@ function DraftDetailModal({
                   if (imageUrlInput.trim()) {
                     const url = imageUrlInput.trim();
                     const mtype = isVideoUrl(url) ? "video" : "image";
-                    onDraftUpdate(draft.id, { media_items: [{ type: mtype, url }], image_url: url });
+                    const updates: Record<string, unknown> = { media_items: [{ type: mtype, url }], image_url: url };
+                    if (draft.status === "failed") { updates.status = "pending"; updates.error_message = null; }
+                    onDraftUpdate(draft.id, updates);
                     setImageUrlInput("");
                   }
                 }} disabled={!imageUrlInput.trim()} className="px-3 py-1.5 rounded-lg text-xs font-medium bg-violet-600/80 text-white disabled:opacity-40 transition-all">
@@ -1129,6 +1375,28 @@ function DraftDetailModal({
             </div>
           )}
         </div>
+
+        {/* Carousel toggle — only meaningful with 2+ media items */}
+        {isPending && mediaItems.length >= 2 && (
+          <div className="px-6 pt-3">
+            <label className="flex items-center justify-between gap-3 px-4 py-3 rounded-xl bg-violet-500/[0.06] border border-violet-500/15 cursor-pointer">
+              <span className="flex flex-col">
+                <span className="text-sm text-white font-medium">Carousel ad</span>
+                <span className="text-[11px] text-gray-400">
+                  {draft.is_carousel
+                    ? `One swipeable ad with ${mediaItems.length} cards`
+                    : `${mediaItems.length} separate ads (A/B test)`}
+                </span>
+              </span>
+              <input
+                type="checkbox"
+                checked={!!draft.is_carousel}
+                onChange={(e) => onDraftUpdate(draft.id, { is_carousel: e.target.checked })}
+                className="w-5 h-5 accent-violet-500"
+              />
+            </label>
+          </div>
+        )}
 
         {/* Body */}
         <div className="px-6 py-6 space-y-5">
@@ -1258,6 +1526,39 @@ function DraftDetailModal({
                 </div>
               )}
 
+              {/* Campaign Objective */}
+              {draft.draft_type === "paid" && (
+                <div>
+                  <label className="text-[11px] text-gray-500 mb-1 block">Campaign Objective</label>
+                  <select value={campaignObjective} onChange={(e) => setCampaignObjective(e.target.value)}
+                    className="w-full px-3 py-2.5 rounded-xl bg-white/[0.04] border border-white/[0.08] text-white text-sm focus:outline-none focus:border-violet-500/40 transition-all">
+                    <option value="">Auto-detect</option>
+                    <option value="OUTCOME_LEADS">Leads</option>
+                    <option value="OUTCOME_SALES">Sales</option>
+                    <option value="OUTCOME_TRAFFIC">Traffic</option>
+                    <option value="OUTCOME_ENGAGEMENT">Engagement</option>
+                    <option value="OUTCOME_AWARENESS">Awareness</option>
+                  </select>
+                  <p className="mt-1 text-[10px] text-gray-500">
+                    {campaignObjective
+                      ? `Will use ${campaignObjective.replace("OUTCOME_", "")} objective`
+                      : (() => {
+                          const _LE = ["LEAD", "COMPLETE_REGISTRATION", "CONTACT", "SCHEDULE"];
+                          const dest = campaignDest;
+                          const evt = conversionEvent;
+                          if (dest === "INSTAGRAM_DM") return "Auto: Engagement (IG DM)";
+                          if (dest === "INSTANT_FORM") return "Auto: Leads (Instant Form)";
+                          if (dest === "WHATSAPP") return "Auto: Traffic (WhatsApp)";
+                          if (dest === "MESSAGING") return "Auto: Engagement (Messaging)";
+                          if (dest === "PHONE_CALL") return "Auto: Leads (Phone)";
+                          if (draft.pixel_id) return _LE.includes(evt) ? "Auto: Leads (pixel + event)" : "Auto: Sales (pixel + event)";
+                          return "Auto: Traffic (no pixel)";
+                        })()
+                    }
+                  </p>
+                </div>
+              )}
+
               <div className="grid grid-cols-2 gap-3">
                 <div>
                   <label className="text-xs text-gray-500 mb-1.5 block">CTA Button</label>
@@ -1341,13 +1642,89 @@ function DraftDetailModal({
                   )}
                 </div>
               )}
+              {/* Geo Targeting Override */}
+              {draft.draft_type === "paid" && (
+                <div className="bg-blue-500/[0.04] border border-blue-500/10 rounded-xl px-4 py-4 space-y-3">
+                  <div className="flex items-center gap-2">
+                    <Target className="w-4 h-4 text-blue-400" />
+                    <p className="text-[10px] font-semibold uppercase tracking-wider text-blue-400">Geo Targeting (Override)</p>
+                  </div>
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label className="text-xs text-gray-500 mb-1.5 block">
+                        Target Countries
+                        <span className="text-[10px] text-gray-600 ml-1">(select multiple — Meta will target all)</span>
+                      </label>
+                      {(() => {
+                        const selectedCodes = editCountry
+                          ? editCountry.split(",").map((c) => c.trim()).filter(Boolean)
+                          : [];
+                        const removeCountry = (code: string) => {
+                          const next = selectedCodes.filter((c) => c !== code);
+                          setEditCountry(next.join(","));
+                        };
+                        const addCountry = (code: string) => {
+                          if (!code || selectedCodes.includes(code)) return;
+                          setEditCountry([...selectedCodes, code].join(","));
+                        };
+                        return (
+                          <div className="space-y-2">
+                            {/* Selected chips */}
+                            {selectedCodes.length > 0 && (
+                              <div className="flex flex-wrap gap-1.5 p-2 rounded-xl bg-white/[0.02] border border-white/[0.06]">
+                                {selectedCodes.map((code) => (
+                                  <span
+                                    key={code}
+                                    className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-blue-500/15 border border-blue-500/30 text-[11px] text-blue-300 font-medium"
+                                  >
+                                    {COUNTRY_NAMES[code as keyof typeof COUNTRY_NAMES] || code}
+                                    <button
+                                      onClick={() => removeCountry(code)}
+                                      className="text-blue-400 hover:text-red-400 transition-colors"
+                                      type="button"
+                                    >
+                                      ×
+                                    </button>
+                                  </span>
+                                ))}
+                              </div>
+                            )}
+                            {/* Add country dropdown */}
+                            <select
+                              value=""
+                              onChange={(e) => { addCountry(e.target.value); e.target.value = ""; }}
+                              className="w-full px-3 py-2.5 rounded-xl bg-white/[0.04] border border-white/[0.08] text-white text-sm focus:outline-none focus:border-violet-500/40 transition-all"
+                            >
+                              <option value="">
+                                {selectedCodes.length === 0 ? "Use default — pick countries..." : "+ Add another country..."}
+                              </option>
+                              {Object.entries(COUNTRY_NAMES)
+                                .filter(([code]) => !selectedCodes.includes(code))
+                                .map(([code, name]) => (
+                                  <option key={code} value={code}>{name}</option>
+                                ))}
+                            </select>
+                          </div>
+                        );
+                      })()}
+                    </div>
+                    <div>
+                      <label className="text-xs text-gray-500 mb-1.5 block">Target Cities (optional)</label>
+                      <input type="text" value={editCities} onChange={(e) => setEditCities(e.target.value)}
+                        placeholder="e.g. Lahore, Karachi, Islamabad"
+                        className="w-full px-3 py-2.5 rounded-xl bg-white/[0.04] border border-white/[0.08] text-white text-sm placeholder-gray-600 focus:outline-none focus:border-violet-500/40 transition-all" />
+                    </div>
+                  </div>
+                  <p className="text-[10px] text-gray-500">Leave cities blank to target the entire country. Separate cities with commas.</p>
+                </div>
+              )}
               <div className="flex gap-2 pt-1">
                 <button onClick={handleSaveEdits} disabled={saving}
                   className="flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-semibold bg-gradient-to-r from-violet-600 to-blue-600 hover:from-violet-500 hover:to-blue-500 text-white transition-all disabled:opacity-50">
                   {saving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <CheckCircle2 className="w-3.5 h-3.5" />}
                   Save Changes
                 </button>
-                <button onClick={() => { setEditing(false); setHeadline(draft.headline ?? ""); setBodyText(draft.body_text); setCtaType(draft.cta_type ?? "SHOP_NOW"); setBudget(String(draft.proposed_budget ?? "")); }}
+                <button onClick={() => { setEditing(false); setHeadline(draft.headline ?? ""); setBodyText(draft.body_text); setCtaType(draft.cta_type ?? "SHOP_NOW"); setBudget(String(draft.proposed_budget ?? "")); setEditCountry(_initCountry); setEditCities(_initCities); }}
                   className="px-4 py-2.5 rounded-xl text-sm text-gray-400 hover:text-white bg-white/[0.03] border border-white/[0.06] transition-all">
                   Cancel
                 </button>
@@ -1411,7 +1788,9 @@ function DraftDetailModal({
               {/* Geo-Cultural Targeting Spec (Detail View) */}
               {draft.draft_type === "paid" && (() => {
                 const spec = parseTargetingSpec(draft.targeting_spec);
-                const country = spec?.target_country || draft.target_country;
+                const draftTgt2 = (draft.targeting || {}) as Record<string, unknown>;
+                const country = (draftTgt2.target_country as string) || spec?.target_country || draft.target_country;
+                const viewCities = (draftTgt2.target_cities as string[]) || [];
                 const interests = spec?.validated_interests;
                 if (!country && !interests?.length) return null;
                 return (
@@ -1420,6 +1799,7 @@ function DraftDetailModal({
                       <Target className="w-4 h-4 text-blue-400" />
                       <p className="text-[10px] font-semibold uppercase tracking-wider text-blue-400">
                         Geo-Cultural Targeting: {country ? COUNTRY_NAMES[country] || country : ""}
+                        {viewCities.length > 0 && ` — ${viewCities.join(", ")}`}
                       </p>
                     </div>
                     {interests && interests.length > 0 && (
@@ -1434,6 +1814,26 @@ function DraftDetailModal({
                             )}
                           </span>
                         ))}
+                        {spec?.validated_behaviors?.map((b: { id: string; name: string; audience_size?: number }) => (
+                          <span key={b.id} className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-amber-500/10 text-xs text-amber-300 border border-amber-500/15">
+                            ⊙ {b.name}
+                            {b.audience_size && (
+                              <span className="text-[9px] text-amber-400/50">
+                                ({b.audience_size > 1000000 ? `${(b.audience_size / 1000000).toFixed(1)}M` : `${(b.audience_size / 1000).toFixed(0)}K`})
+                              </span>
+                            )}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                    {spec?.advantage_plus_expanded && (
+                      <div className="flex items-center gap-2 mt-1">
+                        <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[11px] font-medium bg-gradient-to-r from-purple-500/15 to-blue-500/15 text-purple-300 border border-purple-500/20">
+                          <span className="text-sm">✨</span> Advantage+ Auto-Expansion ON
+                        </span>
+                        <span className="text-[10px] text-gray-500 italic">
+                          Highly specific niche — Meta AI expands beyond these interests to find ideal matches
+                        </span>
                       </div>
                     )}
                     {spec?.suggested_keywords && spec.suggested_keywords.length > 0 && (
@@ -1506,7 +1906,7 @@ function DraftDetailModal({
                       </span>
                       <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-blue-500/10 text-xs text-blue-400 border border-blue-500/15">
                         <Target className="w-3 h-3" />
-                        Optimize for: Link Clicks
+                        Optimize for: Conversations
                       </span>
                     </div>
                   ) : draft.destination_type === "INSTAGRAM_DM" ? (
@@ -1557,6 +1957,30 @@ function DraftDetailModal({
                   ) : (
                     <p className="text-xs text-gray-500">No pixel attached — ad will optimize for traffic (link clicks) instead of conversions.</p>
                   )}
+                </div>
+              )}
+
+              {/* Campaign Objective badge */}
+              {draft.draft_type === "paid" && (
+                <div className="flex items-center gap-2">
+                  <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-indigo-500/10 text-xs text-indigo-400 border border-indigo-500/15">
+                    <Target className="w-3 h-3" />
+                    Objective: {draft.campaign_objective
+                      ? draft.campaign_objective.replace("OUTCOME_", "")
+                      : (() => {
+                          const _LE = ["LEAD", "COMPLETE_REGISTRATION", "CONTACT", "SCHEDULE"];
+                          const dest = draft.destination_type || "WEBSITE";
+                          const evt = (draft.conversion_event || "PURCHASE").toUpperCase();
+                          if (dest === "INSTAGRAM_DM") return "Engagement (auto)";
+                          if (dest === "INSTANT_FORM") return "Leads (auto)";
+                          if (dest === "WHATSAPP") return "Traffic (auto)";
+                          if (dest === "MESSAGING") return "Engagement (auto)";
+                          if (dest === "PHONE_CALL") return "Leads (auto)";
+                          if (draft.pixel_id) return _LE.includes(evt) ? "Leads (auto)" : "Sales (auto)";
+                          return "Traffic (auto)";
+                        })()
+                    }
+                  </span>
                 </div>
               )}
 
@@ -1635,6 +2059,8 @@ function DraftCard({
   onOpen,
   loading,
   budgetCurrency,
+  selected,
+  onToggleSelect,
 }: {
   draft: Draft;
   onApprove: (id: string) => void;
@@ -1645,8 +2071,12 @@ function DraftCard({
   onOpen: (draft: Draft) => void;
   budgetCurrency: string;
   loading: string | null;
+  selected?: boolean;
+  onToggleSelect?: (id: string) => void;
 }) {
   const isPending = draft.status === "pending";
+  const isFailed = draft.status === "failed";
+  const canAttachCreative = isPending || isFailed;
   const [showCreativeOptions, setShowCreativeOptions] = useState(false);
   const [imageUrl, setImageUrl] = useState("");
   const [uploading, setUploading] = useState(false);
@@ -1665,13 +2095,16 @@ function DraftCard({
     try {
       const currentItems: MediaItem[] = [...(draft.media_items || [])];
       for (let i = 0; i < files.length; i++) {
-        if (currentItems.length >= 4) break;
+        if (currentItems.length >= 10) break;
         const file = files[i];
         const { data } = await api.uploadProductImage(file);
         const mtype = file.type.startsWith("video/") ? "video" : "image";
         currentItems.push({ type: mtype as "image" | "video", url: data.url });
       }
-      onDraftUpdate(draft.id, { media_items: currentItems, image_url: currentItems[0]?.url || null });
+      const updates: Record<string, unknown> = { media_items: currentItems, image_url: currentItems[0]?.url || null };
+      // If a failed draft is having its missing creative supplied, revert to pending so it can be re-approved.
+      if (draft.status === "failed") { updates.status = "pending"; updates.error_message = null; }
+      onDraftUpdate(draft.id, updates);
       setShowCreativeOptions(false);
     } catch {
       setUploadError("Failed to read file.");
@@ -1696,7 +2129,9 @@ function DraftCard({
     if (imageUrl.trim()) {
       const url = imageUrl.trim();
       const mtype = isVideoUrl(url) ? "video" : "image";
-      onDraftUpdate(draft.id, { media_items: [{ type: mtype, url }], image_url: url });
+      const updates: Record<string, unknown> = { media_items: [{ type: mtype, url }], image_url: url };
+      if (draft.status === "failed") { updates.status = "pending"; updates.error_message = null; }
+      onDraftUpdate(draft.id, updates);
       setImageUrl("");
       setShowCreativeOptions(false);
     }
@@ -1709,7 +2144,7 @@ function DraftCard({
       <div
         className="relative h-40 bg-gradient-to-br from-white/[0.03] to-white/[0.01] flex items-center justify-center border-b border-white/[0.06] cursor-pointer"
         onClick={() => {
-          if (cardMediaItems.length === 0 && isPending) {
+          if (cardMediaItems.length === 0 && canAttachCreative) {
             setShowCreativeOptions(!showCreativeOptions);
           } else {
             onOpen(draft);
@@ -1729,10 +2164,10 @@ function DraftCard({
               </div>
             )}
           </>
-        ) : isPending ? (
+        ) : canAttachCreative ? (
           <div className="flex flex-col items-center gap-2 text-gray-500 hover:text-gray-300 transition-colors">
             <ImageIcon className="w-8 h-8" />
-            <span className="text-xs font-medium">Add Creative</span>
+            <span className="text-xs font-medium">{isFailed ? "Add Creative & Retry" : "Add Creative"}</span>
           </div>
         ) : (
           <div className="flex flex-col items-center gap-2 text-gray-600">
@@ -1741,7 +2176,7 @@ function DraftCard({
           </div>
         )}
         {/* Badges overlay */}
-        <div className="absolute top-3 left-3 flex items-center gap-1.5">
+        <div className="absolute top-3 left-3 flex items-center gap-1.5 flex-wrap max-w-[calc(100%-3rem)]">
           <TypeBadge type={draft.draft_type} onToggle={draft.status === "pending" ? () => {
             const newType = draft.draft_type === "paid" ? "organic" : "paid";
             const updates: Record<string, unknown> = { draft_type: newType };
@@ -1751,6 +2186,24 @@ function DraftCard({
             onDraftUpdate(draft.id, updates);
           } : undefined} />
           <StatusBadge status={draft.status} />
+          {draft.special_ad_category && SAC_DISPLAY[draft.special_ad_category] && (
+            <span
+              className={`group/sac relative px-2 py-0.5 rounded-md text-[10px] font-semibold uppercase tracking-wider border ${SAC_DISPLAY[draft.special_ad_category].color}`}
+              title={draft.special_ad_category_reasoning || `Meta Special Ad Category: ${SAC_DISPLAY[draft.special_ad_category].label}`}
+            >
+              SAC · {SAC_DISPLAY[draft.special_ad_category].label}
+              {draft.special_ad_category_reasoning && (
+                <span className="invisible group-hover/sac:visible absolute left-0 top-full mt-1 z-50 w-64 p-2 rounded-lg bg-black/95 border border-white/10 text-[10px] text-gray-300 normal-case font-normal tracking-normal leading-snug shadow-2xl">
+                  <strong className="text-white">Why this category:</strong> {draft.special_ad_category_reasoning}
+                  {draft.special_ad_category_confidence != null && (
+                    <span className="block mt-1 text-gray-500">
+                      Confidence: {Math.round((draft.special_ad_category_confidence ?? 0) * 100)}%
+                    </span>
+                  )}
+                </span>
+              )}
+            </span>
+          )}
         </div>
         {/* Expand icon */}
         <button
@@ -1759,10 +2212,23 @@ function DraftCard({
         >
           <Maximize2 className="w-3.5 h-3.5" />
         </button>
+        {/* A/B test selection checkbox — only for pending paid drafts */}
+        {isPending && draft.draft_type === "paid" && onToggleSelect && (
+          <button
+            onClick={(e) => { e.stopPropagation(); onToggleSelect(draft.id); }}
+            className={`absolute bottom-3 right-3 w-6 h-6 rounded-lg border-2 flex items-center justify-center transition-all ${
+              selected
+                ? "bg-blue-500 border-blue-500 text-white"
+                : "bg-black/40 border-white/30 text-transparent hover:border-blue-400"
+            }`}
+          >
+            {selected && <CheckCircle2 className="w-3.5 h-3.5" />}
+          </button>
+        )}
       </div>
 
       {/* Creative options panel */}
-      {isPending && showCreativeOptions && cardMediaItems.length === 0 && (
+      {canAttachCreative && showCreativeOptions && cardMediaItems.length === 0 && (
         <div className="px-4 py-3 border-b border-white/[0.06] bg-violet-500/[0.03] space-y-2.5 animate-fade-in">
           <p className="text-[10px] font-semibold uppercase tracking-wider text-violet-400">Attach Creative</p>
           <div className="flex gap-2">
@@ -1775,7 +2241,7 @@ function DraftCard({
             </button>
             <label className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg text-xs font-medium bg-white/[0.05] border border-white/[0.08] text-gray-300 hover:bg-white/[0.08] transition-all cursor-pointer">
               {uploading ? <Loader2 className="w-3 h-3 animate-spin" /> : <Upload className="w-3 h-3" />}
-              Upload Media (1-4)
+              Upload Media (1-10)
               <input type="file" accept="image/jpeg,image/png,image/webp,video/mp4,video/quicktime,video/webm" multiple onChange={handleFileUpload} className="hidden" />
             </label>
           </div>
@@ -1838,7 +2304,21 @@ function DraftCard({
           </div>
         )}
 
-        {/* Error */}
+        {/* Error + Convert-to-Draft action */}
+        {draft.status === "failed" && (
+          <div className="flex items-center justify-between gap-3 mb-4">
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                onDraftUpdate(draft.id, { status: "pending", error_message: null });
+              }}
+              className="flex-1 flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-xs font-medium bg-violet-500/10 hover:bg-violet-500/15 text-violet-300 border border-violet-500/20 transition-all"
+            >
+              <RefreshCw className="w-3.5 h-3.5" />
+              Convert to Draft (edit & retry)
+            </button>
+          </div>
+        )}
         {draft.status === "failed" && draft.error_message && (
           <div className="flex items-start gap-2 bg-red-500/[0.05] border border-red-500/10 rounded-lg px-3 py-2 mb-4">
             <XCircle className="w-3.5 h-3.5 text-red-400 mt-0.5 shrink-0" />
@@ -1866,7 +2346,9 @@ function DraftCard({
         {/* Geo-Cultural Targeting */}
         {draft.draft_type === "paid" && (() => {
           const spec = parseTargetingSpec(draft.targeting_spec);
-          const country = spec?.target_country || draft.target_country;
+          const cardTgt2 = (draft.targeting || {}) as Record<string, unknown>;
+          const country = (cardTgt2.target_country as string) || spec?.target_country || draft.target_country;
+          const cardCities2 = (cardTgt2.target_cities as string[]) || [];
           const interests = spec?.validated_interests;
           if (!country && !interests?.length) return null;
           return (
@@ -1874,7 +2356,7 @@ function DraftCard({
               <Target className="w-3.5 h-3.5 text-blue-400 mt-0.5 shrink-0" />
               <div className="min-w-0">
                 <p className="text-[10px] font-semibold uppercase tracking-wider text-blue-400 mb-1">
-                  Targeting: {country ? COUNTRY_NAMES[country] || country : ""}
+                  Targeting: {country ? COUNTRY_NAMES[country] || country : ""}{cardCities2.length > 0 && ` — ${cardCities2.join(", ")}`}
                 </p>
                 {interests && interests.length > 0 && (
                   <div className="flex flex-wrap gap-1">
@@ -1888,6 +2370,135 @@ function DraftCard({
                     )}
                   </div>
                 )}
+                {spec?.advantage_plus_expanded && (
+                  <span className="inline-flex items-center gap-1 mt-1 px-2 py-0.5 rounded-md text-[10px] font-medium bg-gradient-to-r from-purple-500/15 to-blue-500/15 text-purple-300 border border-purple-500/20">
+                    <span className="text-xs">✨</span> Advantage+ Expansion
+                  </span>
+                )}
+              </div>
+            </div>
+          );
+        })()}
+
+        {/* SAC reconciliation — what Meta actually accepted vs what we sent.
+            Populated ~30s after publish by sac_reconciler. Only meaningful for
+            SAC drafts; non-SAC drafts have targeting_diff=null and skip this. */}
+        {draft.draft_type === "paid" && draft.targeting_diff && draft.targeting_diff.sent_count > 0 && (() => {
+          const diff = draft.targeting_diff!;
+          const RECON_STYLES: Record<string, { wrap: string; icon: string; label: string; chip: string; title: string }> = {
+            clean: {
+              wrap: "bg-emerald-500/[0.04] border border-emerald-500/15", icon: "text-emerald-400",
+              label: "text-emerald-400", chip: "bg-emerald-500/10 text-emerald-200 border border-emerald-500/20",
+              title: "All targeting accepted by Meta",
+            },
+            partial: {
+              wrap: "bg-amber-500/[0.04] border border-amber-500/15", icon: "text-amber-400",
+              label: "text-amber-400", chip: "bg-amber-500/10 text-amber-200 border border-amber-500/20",
+              title: "Meta stripped some interests",
+            },
+            heavy: {
+              wrap: "bg-orange-500/[0.04] border border-orange-500/15", icon: "text-orange-400",
+              label: "text-orange-400", chip: "bg-orange-500/10 text-orange-200 border border-orange-500/20",
+              title: "Meta stripped most interests",
+            },
+            total_strip: {
+              wrap: "bg-red-500/[0.04] border border-red-500/15", icon: "text-red-400",
+              label: "text-red-400", chip: "bg-red-500/10 text-red-200 border border-red-500/20",
+              title: "Meta stripped ALL interests — running broad",
+            },
+            no_interests_sent: {
+              wrap: "bg-gray-500/[0.04] border border-gray-500/15", icon: "text-gray-400",
+              label: "text-gray-400", chip: "bg-gray-500/10 text-gray-200 border border-gray-500/20",
+              title: "No interests sent",
+            },
+          };
+          const tone = RECON_STYLES[diff.severity] || RECON_STYLES.partial;
+          return (
+            <div className={`flex items-start gap-2 ${tone.wrap} rounded-lg px-3 py-2 mb-4`}>
+              <Target className={`w-3.5 h-3.5 ${tone.icon} mt-0.5 shrink-0`} />
+              <div className="min-w-0 flex-1">
+                <p className={`text-[10px] font-semibold uppercase tracking-wider ${tone.label} mb-1`}>
+                  Meta reconciliation: {tone.title} ({diff.kept_count}/{diff.sent_count} kept)
+                </p>
+                {diff.stripped_interests.length > 0 && (
+                  <div className="flex flex-wrap gap-1 mb-1">
+                    {diff.stripped_interests.slice(0, 6).map((it) => (
+                      <span key={it.id} className={`px-1.5 py-0.5 rounded text-[10px] ${tone.chip} line-through opacity-80`}>
+                        {it.name}
+                      </span>
+                    ))}
+                    {diff.stripped_interests.length > 6 && (
+                      <span className="text-[10px] text-gray-500">+{diff.stripped_interests.length - 6} more stripped</span>
+                    )}
+                  </div>
+                )}
+                {diff.stripped_count > 0 && (
+                  <p className="text-[10px] text-gray-400 leading-tight">
+                    The system has learned these — future {draft.special_ad_category ? SAC_DISPLAY[draft.special_ad_category]?.label || draft.special_ad_category : "SAC"} drafts will skip them automatically.
+                  </p>
+                )}
+                {diff.advantage_audience_active && (
+                  <span className="inline-flex items-center gap-1 mt-1 px-2 py-0.5 rounded-md text-[10px] font-medium bg-gradient-to-r from-purple-500/15 to-blue-500/15 text-purple-300 border border-purple-500/20">
+                    <span className="text-xs">✨</span> Advantage+ Audience active
+                  </span>
+                )}
+              </div>
+            </div>
+          );
+        })()}
+
+        {/* Phase B — auto-recovery status. Renders only when sac_recovery
+            has touched the draft (status set). Shows pending state, the
+            replacement interests on success, or a manual-intervention hint
+            on failure. */}
+        {draft.draft_type === "paid" && draft.auto_recovery_status && (() => {
+          const status = draft.auto_recovery_status!;
+          const attempts = draft.auto_recovery_attempts ?? 0;
+          const RECOVERY_STYLES: Record<string, { wrap: string; icon: string; label: string; title: string; hint: string }> = {
+            pending: {
+              wrap: "bg-blue-500/[0.04] border border-blue-500/15", icon: "text-blue-400",
+              label: "text-blue-400", title: `Auto-recovering targeting (attempt ${attempts})…`,
+              hint: "Generating SAC-safe replacement interests and swapping them on Meta.",
+            },
+            recovered: {
+              wrap: "bg-emerald-500/[0.04] border border-emerald-500/15", icon: "text-emerald-400",
+              label: "text-emerald-400", title: `Auto-recovered (attempt ${attempts})`,
+              hint: "Stripped interests have been replaced with SAC-safe alternatives on the live ad set.",
+            },
+            no_alternatives: {
+              wrap: "bg-amber-500/[0.04] border border-amber-500/15", icon: "text-amber-400",
+              label: "text-amber-400", title: "Auto-recovery: no valid replacements",
+              hint: "The system couldn't find SAC-safe replacement interests. Ad set is running with whatever Meta accepted plus Advantage+ broad targeting.",
+            },
+            llm_failed: {
+              wrap: "bg-red-500/[0.04] border border-red-500/15", icon: "text-red-400",
+              label: "text-red-400", title: "Auto-recovery error (LLM)",
+              hint: "Couldn't generate replacement interests — manual intervention may be needed.",
+            },
+            patch_failed: {
+              wrap: "bg-red-500/[0.04] border border-red-500/15", icon: "text-red-400",
+              label: "text-red-400", title: "Auto-recovery error (Meta API)",
+              hint: "Replacement interests generated but Meta rejected the swap.",
+            },
+          };
+          const tone = RECOVERY_STYLES[status] || RECOVERY_STYLES.pending;
+          return (
+            <div className={`flex items-start gap-2 ${tone.wrap} rounded-lg px-3 py-2 mb-4`}>
+              <Target className={`w-3.5 h-3.5 ${tone.icon} mt-0.5 shrink-0`} />
+              <div className="min-w-0 flex-1">
+                <p className={`text-[10px] font-semibold uppercase tracking-wider ${tone.label} mb-1`}>
+                  {tone.title}
+                </p>
+                {draft.recovered_interests && draft.recovered_interests.length > 0 && status === "recovered" && (
+                  <div className="flex flex-wrap gap-1 mb-1">
+                    {draft.recovered_interests.slice(0, 6).map((it) => (
+                      <span key={it.id} className="px-1.5 py-0.5 rounded bg-emerald-500/10 text-[10px] text-emerald-200 border border-emerald-500/20">
+                        {it.name}
+                      </span>
+                    ))}
+                  </div>
+                )}
+                <p className="text-[10px] text-gray-400 leading-tight">{tone.hint}</p>
               </div>
             </div>
           );
@@ -2057,6 +2668,9 @@ export default function DraftsPage() {
   const [genWaNumber, setGenWaNumber] = useState("");
   const [genMsgApps, setGenMsgApps] = useState<string[]>(["MESSENGER"]);
   const [genCallPhone, setGenCallPhone] = useState("");
+  const [selectedAbIds, setSelectedAbIds] = useState<Set<string>>(new Set());
+  const [abLaunching, setAbLaunching] = useState(false);
+  const [abError, setAbError] = useState<string | null>(null);
 
   useEffect(() => {
     api.getPreferences().then((res: { data?: { budget_currency?: string; whatsapp_number?: string } }) => {
@@ -2200,8 +2814,41 @@ export default function DraftsPage() {
     }
   };
 
+  const toggleAbSelect = (id: string) => {
+    setSelectedAbIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+    setAbError(null);
+  };
+
+  const handleLaunchAbTest = async () => {
+    const ids = Array.from(selectedAbIds);
+    if (ids.length < 2) {
+      setAbError("Select at least 2 drafts for an A/B test");
+      return;
+    }
+    setAbLaunching(true);
+    setAbError(null);
+    try {
+      await api.launchAbTest(ids);
+      // Mark selected drafts as approved locally
+      setDrafts((prev: Draft[]) =>
+        prev.map((d: Draft) => selectedAbIds.has(d.id) ? { ...d, status: "approved" as const } : d)
+      );
+      setSelectedAbIds(new Set());
+    } catch (err: any) {
+      const msg = err?.response?.data?.detail || "A/B test launch failed";
+      setAbError(msg);
+    } finally {
+      setAbLaunching(false);
+    }
+  };
+
   return (
-    <div className="p-8 w-full animate-fade-in">
+    <div className="p-8 w-full animate-fade-in relative">
       {/* Detail modal */}
       {selectedDraft && (
         <DraftDetailModal
@@ -2415,8 +3062,42 @@ export default function DraftsPage() {
               onOpen={setSelectedDraft}
               loading={actionLoading}
               budgetCurrency={budgetCurrency}
+              selected={selectedAbIds.has(draft.id)}
+              onToggleSelect={toggleAbSelect}
             />
           ))}
+        </div>
+      )}
+
+      {/* ── Floating A/B Test Action Bar ───────────────────────────── */}
+      {selectedAbIds.size > 0 && (
+        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 flex items-center gap-3 px-5 py-3 rounded-2xl bg-gray-900/95 backdrop-blur-xl border border-white/[0.1] shadow-2xl animate-slide-up">
+          <div className="flex items-center gap-2 text-sm text-gray-300">
+            <Target className="w-4 h-4 text-blue-400" />
+            <span className="font-semibold text-white">{selectedAbIds.size}</span> drafts selected
+          </div>
+          <div className="w-px h-6 bg-white/10" />
+          {abError && (
+            <span className="text-xs text-red-400 max-w-[200px] truncate">{abError}</span>
+          )}
+          <button
+            onClick={() => setSelectedAbIds(new Set())}
+            className="px-3 py-1.5 rounded-lg text-xs font-medium text-gray-400 hover:text-white bg-white/[0.05] hover:bg-white/[0.1] transition-all"
+          >
+            Clear
+          </button>
+          <button
+            onClick={handleLaunchAbTest}
+            disabled={abLaunching || selectedAbIds.size < 2}
+            className="flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-semibold bg-gradient-to-r from-blue-600 to-violet-600 hover:from-blue-500 hover:to-violet-500 text-white transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            {abLaunching ? (
+              <Loader2 className="w-4 h-4 animate-spin" />
+            ) : (
+              <Zap className="w-4 h-4" />
+            )}
+            Launch A/B Test
+          </button>
         </div>
       )}
     </div>

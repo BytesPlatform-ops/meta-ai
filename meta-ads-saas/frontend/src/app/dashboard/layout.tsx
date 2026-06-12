@@ -1,6 +1,7 @@
 import { createClient, isSupabaseConfigured } from "@/lib/supabase/server";
 import { redirect } from "next/navigation";
 import { Sidebar } from "@/components/layout/Sidebar";
+import { WorkspaceShell } from "@/components/layout/WorkspaceShell";
 import Link from "next/link";
 import { AlertTriangle, BarChart3 } from "lucide-react";
 
@@ -53,13 +54,15 @@ export default async function DashboardLayout({ children }: { children: React.Re
   if (!user) redirect("/auth/login");
 
   return (
-    <div className="flex min-h-screen bg-[#0a0a0f]">
-      <Sidebar email={user.email ?? ""}/>
-      <main className="flex-1 overflow-auto relative">
-        {/* Subtle top glow */}
-        <div className="absolute top-0 left-1/3 w-[500px] h-[300px] bg-blue-500/[0.03] rounded-full blur-[100px] pointer-events-none" />
-        <div className="relative z-10">{children}</div>
-      </main>
-    </div>
+    <WorkspaceShell>
+      <div className="flex min-h-screen bg-[#0a0a0f]">
+        <Sidebar email={user.email ?? ""}/>
+        <main className="flex-1 overflow-auto relative">
+          {/* Subtle top glow */}
+          <div className="absolute top-0 left-1/3 w-[500px] h-[300px] bg-blue-500/[0.03] rounded-full blur-[100px] pointer-events-none" />
+          <div className="relative z-10">{children}</div>
+        </main>
+      </div>
+    </WorkspaceShell>
   );
 }

@@ -10,7 +10,7 @@ DELETE /api/v1/rules/{rule_id}                → delete rule
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
-from ...api.deps import get_current_user_id
+from ...api.deps import get_current_user_id, get_workspace_id
 from ...db.supabase_client import get_supabase
 from ...services.mcp_client import mcp_client, MCPError
 
@@ -30,10 +30,10 @@ class ScaleRuleCreate(BaseModel):
     scale_percent: float
 
 
-async def _get_access_token(user_id: str, ad_account_id: str | None = None) -> tuple[str, str]:
-    """Resolve access token and meta_account_id for the user."""
+async def _get_access_token(workspace_id: str, ad_account_id: str | None = None) -> tuple[str, str]:
+    """Resolve access token and meta_account_id for the workspace."""
     supabase = get_supabase()
-    query = supabase.table("ad_accounts").select("*").eq("user_id", user_id).eq("is_active", True)
+    query = supabase.table("ad_accounts").select("*").eq("workspace_id", workspace_id).eq("is_active", True)
     if ad_account_id:
         query = query.eq("meta_account_id", ad_account_id)
     result = query.limit(1).execute()
@@ -47,9 +47,10 @@ async def _get_access_token(user_id: str, ad_account_id: str | None = None) -> t
 async def list_rules(
     ad_account_id: str,
     user_id: str = Depends(get_current_user_id),
+    workspace_id: str = Depends(get_workspace_id),
 ):
     """List automated rules for an ad account."""
-    access_token, meta_id = await _get_access_token(user_id, ad_account_id)
+    access_token, meta_id = await _get_access_token(workspace_id, ad_account_id)
     try:
         result = await mcp_client.call_tool(
             "list_automated_rules",
@@ -65,9 +66,10 @@ async def list_rules(
 async def create_kill_rule(
     body: KillRuleCreate,
     user_id: str = Depends(get_current_user_id),
+    workspace_id: str = Depends(get_workspace_id),
 ):
     """Create a kill rule that pauses a campaign when spend exceeds threshold."""
-    access_token, meta_id = await _get_access_token(user_id, body.ad_account_id)
+    access_token, meta_id = await _get_access_token(workspace_id, body.ad_account_id)
     try:
         result = await mcp_client.call_tool(
             "create_kill_rule",
@@ -87,9 +89,10 @@ async def create_kill_rule(
 async def create_scale_rule(
     body: ScaleRuleCreate,
     user_id: str = Depends(get_current_user_id),
+    workspace_id: str = Depends(get_workspace_id),
 ):
     """Create a scale rule that increases budget when ROAS exceeds threshold."""
-    access_token, meta_id = await _get_access_token(user_id, body.ad_account_id)
+    access_token, meta_id = await _get_access_token(workspace_id, body.ad_account_id)
     try:
         result = await mcp_client.call_tool(
             "create_scale_rule",
@@ -110,9 +113,10 @@ async def create_scale_rule(
 async def toggle_rule(
     rule_id: str,
     user_id: str = Depends(get_current_user_id),
+    workspace_id: str = Depends(get_workspace_id),
 ):
     """Toggle an automated rule on/off."""
-    access_token, _ = await _get_access_token(user_id)
+    access_token, _ = await _get_access_token(workspace_id)
     try:
         result = await mcp_client.call_tool(
             "toggle_automated_rule",
@@ -128,9 +132,10 @@ async def toggle_rule(
 async def delete_rule(
     rule_id: str,
     user_id: str = Depends(get_current_user_id),
+    workspace_id: str = Depends(get_workspace_id),
 ):
     """Delete an automated rule."""
-    access_token, _ = await _get_access_token(user_id)
+    access_token, _ = await _get_access_token(workspace_id)
     try:
         await mcp_client.call_tool(
             "delete_automated_rule",
