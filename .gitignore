@@ -42,3 +42,7 @@ meta-ads-saas/backend/uploads/
 
 # Test artifacts
 test_pixel_logic.py
+
+# Internal reports/docs — keep out of the repo
+*.docx
+Public_Health_Ads_Report.md
